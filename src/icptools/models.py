@@ -9,6 +9,10 @@ class SampleType(Enum):
     UNKNOWN = "UNK"
     METHOD_BLANK = "MBLK"  # Digestion/Method Blank
 
+class SampleMatrix(Enum):
+    LIQUID = "Liquid"
+    SOLID = "Solid"
+
 @dataclass
 class Analyte:
     name: str  # e.g., 'Pb208'
@@ -26,6 +30,10 @@ class Sample:
     raw_intensities: Dict[str, float] = field(default_factory=dict)
     
     # Sample preparation metadata
+    matrix: SampleMatrix = SampleMatrix.LIQUID
+    prep_group: Optional[str] = None  # e.g., "Digestion_Batch_A"
+    requested_analytes: Optional[List[str]] = None  # e.g., ["Pb208", "Cd111"]
+    
     mass: float = 1.0  # Sample mass (e.g., grams)
     final_volume: float = 1.0  # Final volume after digestion (e.g., mL)
     dilution_factor: float = 1.0  # Additional dilution prior to analysis

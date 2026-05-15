@@ -61,36 +61,57 @@ class Processor:
                     sample.instrument_concentrations[analyte_name] = max(0.0, conc) # Assume no negative concentrations
 
     def perform_blank_subtraction(self):
-        """Step 4: Subtracts the average method blank from unknown samples."""
-        method_blanks = [s for s in self.batch.samples if s.sample_type == SampleType.METHOD_BLANK]
+        """Step 4: Subtracts the average method blank from unknown samples by prep_group."""
+        # Calculate average method blank concentrations by prep_group
+        avg_blank_concs: Dict[str, Dict[str, list]] = {}
         
-        # Calculate average method blank concentrations
-        avg_blank_conc = {}
-        for analyte_name in self.calibration_models.keys():
-            concs = [mblk.instrument_concentrations.get(analyte_name, 0.0) for mblk in method_blanks]
-            if concs:
-                avg_blank_conc[analyte_name] = sum(concs) / len(concs)
-            else:
-                avg_blank_conc[analyte_name] = 0.0
+        for sample in self.batch.samples:
+            if sample.sample_type == SampleType.METHOD_BLANK:
+                pg = sample.prep_group
+                if pg not in avg_blank_concs:
+                    avg_blank_concs[pg] = {analyte: [] for analyte in self.calibration_models.keys()}
+                
+                for analyte_name in self.calibration_models.keys():
+                    conc = sample.instrument_concentrations.get(analyte_name, 0.0)
+                    avg_blank_concs[pg][analyte_name].append(conc)
+                    
+        # Average them out
+        final_blank_concs: Dict[str, Dict[str, float]] = {}
+        for pg, analyte_data in avg_blank_concs.items():
+            final_blank_concs[pg] = {}
+            for analyte, concs in analyte_data.items():
+                final_blank_concs[pg][analyte] = sum(concs) / len(concs) if concs else 0.0
                 
         # Subtract from unknowns
         for sample in self.batch.samples:
             if sample.sample_type == SampleType.UNKNOWN:
-                for analyte_name, instr_conc in sample.instrument_concentrations.items():
-                    blank_conc = avg_blank_conc.get(analyte_name, 0.0)
-                    # Subtract and ensure it doesn't go below zero
-                    corrected_conc = max(0.0, instr_conc - blank_conc)
-                    # We store this back in instrument_concentrations, or we can use final_concentrations
-                    # It's cleaner to update instrument_concentrations for intermediate step
-                    sample.instrument_concentrations[analyte_name] = corrected_conc
+                pg = sample.prep_group
+                # If there are method blanks for this exact prep_group, apply them
+                if pg in final_blank_concs:
+                    blank_vals = final_blank_concs[pg]
+                    for analyte_name, instr_conc in sample.instrument_concentrations.items():
+                        blank_conc = blank_vals.get(analyte_name, 0.0)
+                        corrected_conc = max(0.0, instr_conc - blank_conc)
+                        sample.instrument_concentrations[analyte_name] = corrected_conc
 
     def calculate_final_concentrations(self):
         """Step 5: Applies dilution factor, final volume, and mass to get sample concentration."""
+        from .models import SampleMatrix
         for sample in self.batch.samples:
             for analyte_name, instr_conc in sample.instrument_concentrations.items():
-                # Formula: Final Conc = (Instr Conc * Final Volume * Dilution Factor) / Mass
-                if sample.mass > 0:
-                    final_conc = (instr_conc * sample.final_volume * sample.dilution_factor) / sample.mass
-                    sample.final_concentrations[analyte_name] = final_conc
+                
+                # If requested_analytes is specified, skip others
+                if sample.requested_analytes is not None and analyte_name not in sample.requested_analytes:
+                    continue
+                
+                if sample.matrix == SampleMatrix.LIQUID:
+                    # Final Conc = Instr Conc * Dilution Factor (ignore mass and volume)
+                    final_conc = instr_conc * sample.dilution_factor
                 else:
-                    sample.final_concentrations[analyte_name] = 0.0
+                    # Solid: Final Conc = (Instr Conc * Final Volume * Dilution Factor) / Mass
+                    if sample.mass > 0:
+                        final_conc = (instr_conc * sample.final_volume * sample.dilution_factor) / sample.mass
+                    else:
+                        final_conc = 0.0
+                        
+                sample.final_concentrations[analyte_name] = final_conc
