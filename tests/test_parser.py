@@ -108,3 +108,44 @@ def test_parse_agilent_counts_synthetic(tmp_path):
     assert batch.get_sample("S1").sample_type == SampleType.STANDARD
     assert batch.get_sample("Sample1").sample_type == SampleType.UNKNOWN
 
+def test_export_excel_formula_report(tmp_path):
+    import openpyxl
+    from icptools import Batch, Sample, Analyte, SampleType, SampleMatrix, export_excel_formula_report
+    
+    batch = Batch(name="TestBatch")
+    batch.add_analyte(Analyte("Cr52", "Cr", 52))
+    batch.add_analyte(Analyte("Sc45", "Sc", 45, is_internal_standard=True))
+    batch.analyte_to_is["Cr52"] = "Sc45"
+    
+    # Add 2 standards
+    s0 = Sample("S0", SampleType.BLANK, raw_intensities={"Cr52": 100.0, "Sc45": 50000.0}, is_corrected_intensities={"Cr52": 0.002})
+    s0.known_concentrations["Cr52"] = 0.0
+    s1 = Sample("S1", SampleType.STANDARD, raw_intensities={"Cr52": 5000.0, "Sc45": 50000.0}, is_corrected_intensities={"Cr52": 0.100})
+    s1.known_concentrations["Cr52"] = 10.0
+    batch.add_sample(s0)
+    batch.add_sample(s1)
+    
+    # Add unknown sample
+    u1 = Sample("UNK1", SampleType.UNKNOWN, matrix=SampleMatrix.LIQUID, raw_intensities={"Cr52": 2500.0, "Sc45": 50000.0}, dilution_factor=2.0)
+    batch.add_sample(u1)
+    
+    out_xlsx = tmp_path / "formula_report.xlsx"
+    export_excel_formula_report(
+        batch=batch,
+        output_path=out_xlsx,
+        instrument_loqs={"Cr52": 0.5},
+        analytes=["Cr52"]
+    )
+    
+    assert out_xlsx.exists()
+    wb = openpyxl.load_workbook(out_xlsx, data_only=False)
+    ws = wb.active
+    
+    # Verify formulas exist
+    formulas_found = [cell.value for row in ws.iter_rows() for cell in row if str(cell.value or "").startswith("=")]
+    assert any("SLOPE" in str(f) for f in formulas_found)
+    assert any("INTERCEPT" in str(f) for f in formulas_found)
+    assert any("RSQ" in str(f) for f in formulas_found)
+    assert any("IF" in str(f) for f in formulas_found)
+
+

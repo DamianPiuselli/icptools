@@ -12,6 +12,7 @@ from .reporting import (
     generate_reports,
     get_results_dataframe,
     get_calibration_summary,
+    export_excel_formula_report,
 )
 from .parsers import parse_agilent_counts
 
@@ -27,5 +28,6 @@ __all__ = [
     "generate_reports",
     "get_results_dataframe",
     "get_calibration_summary",
+    "export_excel_formula_report",
     "parse_agilent_counts",
 ]

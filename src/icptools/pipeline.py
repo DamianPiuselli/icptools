@@ -59,9 +59,9 @@ class Processor:
         for sample in self.batch.samples:
             for analyte_name, model in self.calibration_models.items():
                 if analyte_name in sample.is_corrected_intensities:
-                    ratio = sample.is_corrected_intensities[analyte_name]
-                    conc = model.calculate_concentration(ratio)
-                    sample.instrument_concentrations[analyte_name] = max(0.0, conc) # Assume no negative concentrations
+                    intensity = sample.is_corrected_intensities[analyte_name]
+                    conc = model.calculate_concentration(intensity)
+                    sample.instrument_concentrations[analyte_name] = conc
 
     def perform_blank_subtraction(self):
         """Step 4: Subtracts the average method blank from unknown samples by prep_group."""
@@ -94,7 +94,7 @@ class Processor:
                     blank_vals = final_blank_concs[pg]
                     for analyte_name, instr_conc in sample.instrument_concentrations.items():
                         blank_conc = blank_vals.get(analyte_name, 0.0)
-                        corrected_conc = max(0.0, instr_conc - blank_conc)
+                        corrected_conc = instr_conc - blank_conc
                         sample.instrument_concentrations[analyte_name] = corrected_conc
 
     def calculate_final_concentrations(self):
@@ -111,9 +111,10 @@ class Processor:
                     # Final Conc = Instr Conc * Dilution Factor (ignore mass and volume)
                     final_conc = instr_conc * sample.dilution_factor
                 else:
-                    # Solid: Final Conc = (Instr Conc * Final Volume * Dilution Factor) / Mass
-                    if sample.mass > 0:
-                        final_conc = (instr_conc * sample.final_volume * sample.dilution_factor) / sample.mass
+                    # Solid: Final Conc = (Instr Conc * Final Volume * Dilution Factor) / Dry Mass
+                    dry_m = sample.dry_mass
+                    if dry_m > 0:
+                        final_conc = (instr_conc * sample.final_volume * sample.dilution_factor) / dry_m
                     else:
                         final_conc = 0.0
                         
