@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 from .models import Batch, SampleType, Sample
 from .calibration import CalibrationModel
 
@@ -6,8 +6,9 @@ class Processor:
     """
     Executes the data processing pipeline on a Batch.
     """
-    def __init__(self, batch: Batch):
+    def __init__(self, batch: Batch, weighting: str = "none"):
         self.batch = batch
+        self.weighting = weighting
         self.calibration_models: Dict[str, CalibrationModel] = {}
 
     def process(self):
@@ -41,13 +42,15 @@ class Processor:
                     # If no IS assigned, raw CPS is the "corrected" intensity
                     sample.is_corrected_intensities[analyte_name] = raw_cps
 
-    def calibrate(self):
+    def calibrate(self, weighting: Optional[str] = None):
         """Step 2: Fits calibration curves for each analyte."""
+        default_wt = weighting or self.weighting
         for analyte_name, analyte in self.batch.analytes.items():
             if analyte.is_internal_standard:
                 continue
                 
-            model = CalibrationModel(analyte_name, self.batch)
+            wt = getattr(self.batch, "analyte_weightings", {}).get(analyte_name, default_wt)
+            model = CalibrationModel(analyte_name, self.batch, weighting=wt)
             model.fit()
             self.calibration_models[analyte_name] = model
 

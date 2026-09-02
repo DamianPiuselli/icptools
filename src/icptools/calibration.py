@@ -17,15 +17,29 @@ class CalibrationModel:
 
     def fit(self):
         """Fits the calibration curve using the Standard samples in the batch."""
-        standards = [s for s in self.batch.samples if s.sample_type == SampleType.STANDARD]
+        standard_ids = self.batch.analyte_calibration_standards.get(self.analyte_name)
         
         x = []
         y = []
         
-        for std in standards:
-            if self.analyte_name in std.known_concentrations and self.analyte_name in std.is_corrected_intensities:
-                x.append(std.known_concentrations[self.analyte_name])
-                y.append(std.is_corrected_intensities[self.analyte_name])
+        for sample in self.batch.samples:
+            if standard_ids is not None:
+                # If specific standards are assigned to this analyte, only consider them
+                is_match = (
+                    sample.sample_id in standard_ids
+                    or (sample.sample_name is not None and sample.sample_name in standard_ids)
+                    or (sample.data_file is not None and sample.data_file in standard_ids)
+                )
+                if not is_match:
+                    continue
+            else:
+                # Default: use samples marked STANDARD or BLANK that have known_concentrations
+                if sample.sample_type not in (SampleType.STANDARD, SampleType.BLANK):
+                    continue
+                
+            if self.analyte_name in sample.known_concentrations and self.analyte_name in sample.is_corrected_intensities:
+                x.append(sample.known_concentrations[self.analyte_name])
+                y.append(sample.is_corrected_intensities[self.analyte_name])
                 
         if len(x) < 2:
             return # Not enough points

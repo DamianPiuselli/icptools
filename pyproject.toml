@@ -21,6 +21,7 @@ dependencies = [
     "pandas",
     "numpy",
     "scipy",
+    "openpyxl",
 ]
 
 [project.optional-dependencies]

@@ -36,8 +36,13 @@ def generate_reports(batch: Batch, include_raw: bool = False) -> Dict[str, pd.Da
             
             row["Dilution Factor"] = sample.dilution_factor
             
-            # Use requested_analytes if available, otherwise all analytes
-            analytes_to_report = sample.requested_analytes if sample.requested_analytes else list(batch.analytes.keys())
+            # Use requested_analytes if available, otherwise all non-ISTD analytes
+            if sample.requested_analytes:
+                analytes_to_report = sample.requested_analytes
+            else:
+                analytes_to_report = [
+                    name for name, a in batch.analytes.items() if not a.is_internal_standard
+                ]
             
             for analyte_name in analytes_to_report:
                 if include_raw:
@@ -77,7 +82,9 @@ def get_results_dataframe(batch: Batch, include_raw: bool = False) -> pd.DataFra
             "Dilution Factor": sample.dilution_factor
         }
         
-        for analyte_name in batch.analytes.keys():
+        for analyte_name, analyte in batch.analytes.items():
+            if analyte.is_internal_standard and not include_raw:
+                continue
             if include_raw:
                 row[f"{analyte_name} [Raw CPS]"] = sample.raw_intensities.get(analyte_name, None)
                 row[f"{analyte_name} [IS Ratio]"] = sample.is_corrected_intensities.get(analyte_name, None)
