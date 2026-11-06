@@ -29,5 +29,8 @@ test = [
     "pytest",
 ]
 
+[project.scripts]
+icptools = "icptools.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

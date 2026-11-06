@@ -1,73 +1,104 @@
 # icptools
 
-A batch-centric Python library for processing ICP-MS and ICP-OES data.
+A batch-centric Python library and CLI for processing **ICP-MS** and **ICP-OES** analytical data, generating audit-ready Excel workbooks with live native formulas.
 
-## Features
+---
 
-- **Object-Oriented Domain Models**: Represents analytical concepts like `Batch`, `Sample`, and `Analyte`.
-- **Automated Processing Pipeline**:
-  - Internal Standard (IS) correction.
-  - Linear calibration fitting with optional weighting (e.g., 1/x).
-  - Method/Digestion blank subtraction.
-  - Sample preparation corrections (Mass, Final Volume, Dilution Factor).
-- **Synthetic Data Generation**: Built-in tools to simulate realistic analytical runs with noise and drift for testing logic without raw files.
-- **Flexible Reporting**: Export results and calibration summaries directly to Pandas DataFrames.
+## Key Features
 
-## Project Structure
+- **Object-Oriented Domain Models**: Represents analytical batches (`Batch`), samples (`Sample`), and elements/isotopes (`Analyte`).
+- **Complete Analytical Pipeline**:
+  - Internal Standard (IS) normalization and % ISTD recovery tracking.
+  - Linear regression calibration with unweighted OLS (`none`), inverse weighting (`1/x`), or anchored blank offset (`blank_offset`).
+  - Selective digestion/method blank (`MBLK`) subtraction by preparation group (`prep_group`).
+  - Physical preparation scaling: sample mass, moisture/humidity correction (% moisture to dry weight basis), digestion volume, and dilution factors.
+- **Audit-Ready Excel Reports with Live Native Formulas**:
+  - Generates formulas (`SLOPE`, `INTERCEPT`, `RSQ`, `SUMPRODUCT`, `SUMSQ`, `AVERAGE`, `IF`, `ROUND`, `TEXT`) in Excel.
+  - Dynamically evaluates sample limits of quantification (`< LoQ`) without producing `#VALUE!` errors upon unit conversion.
+  - Multi-sheet reporting for split dilutions (`export_split_dilution_report` / `export_multidilution_report`).
+- **ISO 17025 / EPA QA-QC Module**:
+  - Continuous calibration verification (`CCV`, `ICV`) and certified reference materials (`CRM`) recovery %.
+  - Duplicate analysis (% RPD).
+  - Matrix spike recovery % (`MS`).
+  - Optional auditable `Control de Calidad (QA-QC)` worksheet with `PASS`/`FAIL` conditional formatting.
+- **Instrument Parsers & Laboratory Preparation Logs**:
+  - Agilent MassHunter Excel counts (`FQ COUNTS.xlsx`) with multi-gas collision disambiguation (`Fe56_NoGas` vs `Fe56_He`) and `CPS RSD` extraction.
+  - Agilent calibration table (`CAL.xlsx`) with automated unit normalization (`ppm`, `ppb`, `ppt` to $\mu\text{g/L}$).
+  - Ingestion of laboratory weighing sheets (`apply_sample_prep`) from CSV or Excel (mass, humidity, volume, dilution, prep group).
+- **Command-Line Interface (CLI)**: Process runs and generate Excel reports directly with `icptools process`.
 
-```text
-icptools/
-├── src/
-│   └── icptools/          # Core package
-│       ├── models.py      # Dataclasses for Batch, Sample, Analyte
-│       ├── pipeline.py    # Processing logic
-│       ├── calibration.py # Curve fitting
-│       ├── reporting.py   # DataFrame export tools
-│       └── synthetic.py   # Data simulation
-├── tests/                 # Unit and integration tests
-├── pyproject.toml         # Project metadata and dependencies
-└── requirements.txt       # Local development dependencies
-```
+---
 
 ## Installation
 
-### For Development
+```bash
+git clone https://github.com/DamianPiuselli/icptools.git
+cd icptools
+pip install -e .
+```
 
-1. Clone the repository.
-2. Create and activate a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -e .
-   ```
+---
 
-## Usage Example
+## Quick Start (Python)
 
 ```python
-from icptools.synthetic import generate_synthetic_batch
-from icptools.pipeline import Processor
-from icptools.reporting import get_results_dataframe
+from icptools import (
+    parse_agilent_counts,
+    parse_agilent_calibration,
+    apply_calibration_table,
+    apply_sample_prep,
+    Processor,
+    export_excel_formula_report,
+)
 
-# 1. Generate a synthetic batch with known properties
-batch, true_values = generate_synthetic_batch(num_unknowns=5)
+# 1. Load instrument run and calibration table
+batch = parse_agilent_counts("datos/FQ_COUNTS.xlsx")
+apply_calibration_table(batch, "datos/CAL.xlsx")
 
-# 2. Initialize the processor and run the pipeline
-processor = Processor(batch)
-processor.process()
+# 2. Ingest laboratory preparation sheet (mass, moisture, digestion volume)
+apply_sample_prep(batch, "datos/PLANILLA_PREPARACION.xlsx")
 
-# 3. Get results as a Pandas DataFrame
-df = get_results_dataframe(batch)
-print(df.head())
+# 3. Process analytical batch
+proc = Processor(batch)
+proc.process()
+
+# 4. Export audit-ready Excel formula report with QA/QC sheet
+export_excel_formula_report(
+    batch=batch,
+    output_path="reportes/Reporte_Final.xlsx",
+    instrument_loqs={"Cr52": 0.2, "As75": 0.5, "Pb208": 0.1},
+    include_qc_sheet=True,
+    report_title="Monitoreo Ambiental 2026",
+)
 ```
+
+---
+
+## Command-Line Interface (CLI)
+
+```bash
+# Process a run with Agilent counts, calibration, and prep log:
+icptools process FQ_COUNTS.xlsx -c CAL.xlsx -p PREP.xlsx -o Reporte.xlsx --qc
+
+# Check QA/QC status in terminal:
+icptools qc FQ_COUNTS.xlsx -c CAL.xlsx
+```
+
+---
+
+## Documentation for AI Agents & Developers
+
+See [AGENTS.md](AGENTS.md) for canonical recipes, unit handling conventions, and validation guidelines.
+
+---
 
 ## Running Tests
 
 ```bash
 pytest
 ```
+
+---
 
 ## License
 

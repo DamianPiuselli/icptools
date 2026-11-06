@@ -30,6 +30,11 @@ from .qc import (
     get_qc_summary,
 )
 
+from .multidilution import (
+    select_optimal_dilution,
+    export_multidilution_report,
+)
+
 __all__ = [
     "Batch",
     "Sample",
@@ -53,4 +58,6 @@ __all__ = [
     "QCEvaluator",
     "QCEvaluationResult",
     "get_qc_summary",
+    "select_optimal_dilution",
+    "export_multidilution_report",
 ]
