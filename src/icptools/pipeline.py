@@ -85,36 +85,41 @@ class Processor:
             for analyte, concs in analyte_data.items():
                 final_blank_concs[pg][analyte] = sum(concs) / len(concs) if concs else 0.0
                 
-        # Subtract from unknowns
+        # Subtract from unknowns into blank_corrected_concentrations without mutating instrument_concentrations
         for sample in self.batch.samples:
             if sample.sample_type == SampleType.UNKNOWN:
                 pg = sample.prep_group
-                # If there are method blanks for this exact prep_group, apply them
-                if pg in final_blank_concs:
-                    blank_vals = final_blank_concs[pg]
-                    for analyte_name, instr_conc in sample.instrument_concentrations.items():
-                        blank_conc = blank_vals.get(analyte_name, 0.0)
-                        corrected_conc = instr_conc - blank_conc
-                        sample.instrument_concentrations[analyte_name] = corrected_conc
+                blank_vals = final_blank_concs.get(pg, {})
+                for analyte_name, instr_conc in sample.instrument_concentrations.items():
+                    blank_conc = blank_vals.get(analyte_name, 0.0)
+                    sample.blank_corrected_concentrations[analyte_name] = instr_conc - blank_conc
+            else:
+                for analyte_name, instr_conc in sample.instrument_concentrations.items():
+                    sample.blank_corrected_concentrations[analyte_name] = instr_conc
 
     def calculate_final_concentrations(self):
         """Step 5: Applies dilution factor, final volume, and mass to get sample concentration."""
         from .models import SampleMatrix
         for sample in self.batch.samples:
-            for analyte_name, instr_conc in sample.instrument_concentrations.items():
+            for analyte_name in sample.instrument_concentrations.keys():
                 
                 # If requested_analytes is specified, skip others
                 if sample.requested_analytes is not None and analyte_name not in sample.requested_analytes:
                     continue
                 
+                # Use blank-corrected concentration if available, else instrument concentration
+                active_conc = sample.blank_corrected_concentrations.get(
+                    analyte_name, sample.instrument_concentrations.get(analyte_name, 0.0)
+                )
+
                 if sample.matrix == SampleMatrix.LIQUID:
-                    # Final Conc = Instr Conc * Dilution Factor (ignore mass and volume)
-                    final_conc = instr_conc * sample.dilution_factor
+                    # Final Conc (ug/L) = Instr Conc * Dilution Factor (ignore mass and volume)
+                    final_conc = active_conc * sample.dilution_factor
                 else:
-                    # Solid: Final Conc = (Instr Conc * Final Volume * Dilution Factor) / Dry Mass
+                    # Solid: Final Conc (mg/kg) = (Instr Conc (ug/L) * (Final Volume (mL) / 1000) * Dilution Factor) / Dry Mass (g)
                     dry_m = sample.dry_mass
                     if dry_m > 0:
-                        final_conc = (instr_conc * sample.final_volume * sample.dilution_factor) / dry_m
+                        final_conc = (active_conc * (sample.final_volume / 1000.0) * sample.dilution_factor) / dry_m
                     else:
                         final_conc = 0.0
                         

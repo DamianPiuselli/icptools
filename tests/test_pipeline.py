@@ -36,16 +36,18 @@ def test_full_pipeline():
         sample_id = row["Sample ID"]
         true_pb = true_concs[sample_id]["Pb208"]
         
-        # MBLK for Digestion_A is Pb:0.5
-        expected_instr_pb = max(0.0, true_pb - 0.5)
         calc_instr_pb = row["Pb208 [Instr Conc]"]
+        # Raw instrument concentration matches true concentration
+        assert abs(calc_instr_pb - true_pb) / true_pb < 0.05
         
-        # Check within 5% tolerance
-        assert abs(calc_instr_pb - expected_instr_pb) / expected_instr_pb < 0.05
+        # MBLK for Digestion_A is Pb:0.5 -> Blank-Corr Conc = true_pb - 0.5
+        expected_bcorr_pb = max(0.0, true_pb - 0.5)
+        calc_bcorr_pb = row["Pb208 [Blank-Corr]"]
+        assert abs(calc_bcorr_pb - expected_bcorr_pb) / expected_bcorr_pb < 0.05
         
-        # Solid formula: Instr * 50 * 10 / 0.5
+        # Solid formula: Blank-Corr (ug/L) * (50 mL / 1000) * Dilution (10.0) / Mass (0.5 g) -> mg/kg
         calc_final_pb = row["Pb208 [Final Conc]"]
-        expected_final_pb = calc_instr_pb * 50.0 * 10.0 / 0.5
+        expected_final_pb = (calc_bcorr_pb * (50.0 / 1000.0) * 10.0) / 0.5
         assert pytest.approx(calc_final_pb, 1e-4) == expected_final_pb
         
     # Check Liquid Unknowns
@@ -98,7 +100,7 @@ def test_humidity_correction():
         matrix=SampleMatrix.SOLID,
         mass=1.0,
         percent_humidity=20.0,
-        final_volume=0.1,
+        final_volume=100.0,  # 100 mL
         dilution_factor=1.0,
         raw_intensities={"Pb208": 1000.0}
     )

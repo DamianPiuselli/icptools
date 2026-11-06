@@ -38,9 +38,19 @@ class Sample:
     
     mass: float = 1.0  # Sample mass as weighed / wet mass (e.g., grams)
     percent_humidity: float = 0.0  # Moisture / humidity percentage (0.0 to 100.0)
-    final_volume: float = 1.0  # Final volume after digestion (e.g., mL or L)
+    final_volume: float = 50.0  # Final volume after digestion in mL (default: 50.0 mL)
     dilution_factor: float = 1.0  # Additional dilution prior to analysis
     
+    def __post_init__(self):
+        if self.mass <= 0:
+            raise ValueError(f"Sample mass must be positive, got {self.mass}")
+        if self.final_volume <= 0:
+            raise ValueError(f"Final volume must be positive, got {self.final_volume}")
+        if self.dilution_factor <= 0:
+            raise ValueError(f"Dilution factor must be positive, got {self.dilution_factor}")
+        if self.percent_humidity < 0.0 or self.percent_humidity >= 100.0:
+            raise ValueError(f"Percent humidity must be in range [0, 100), got {self.percent_humidity}")
+
     @property
     def dry_mass(self) -> float:
         """Calculates the dry/net mass in grams: mass * (1 - percent_humidity / 100)."""
@@ -51,7 +61,8 @@ class Sample:
     # Processed Results state
     is_corrected_intensities: Dict[str, float] = field(default_factory=dict)
     instrument_concentrations: Dict[str, float] = field(default_factory=dict) # e.g., ug/L
-    final_concentrations: Dict[str, float] = field(default_factory=dict) # e.g., mg/kg
+    blank_corrected_concentrations: Dict[str, float] = field(default_factory=dict) # e.g., ug/L after method blank subtraction
+    final_concentrations: Dict[str, float] = field(default_factory=dict) # e.g., mg/kg or ug/L
     
     # Calibration true concentrations (used for standard samples)
     known_concentrations: Dict[str, float] = field(default_factory=dict)

@@ -53,6 +53,8 @@ def generate_reports(batch: Batch, include_raw: bool = False) -> Dict[str, pd.Da
                     row[f"{analyte_name} [IS Ratio]"] = sample.is_corrected_intensities.get(analyte_name, None)
                     
                 row[f"{analyte_name} [Instr Conc (ug/L)]"] = sample.instrument_concentrations.get(analyte_name, None)
+                if sample.blank_corrected_concentrations:
+                    row[f"{analyte_name} [Blank-Corr (ug/L)]"] = sample.blank_corrected_concentrations.get(analyte_name, None)
                 
                 # Check if we successfully calculated a final concentration for this analyte
                 if analyte_name in sample.final_concentrations:
@@ -95,6 +97,8 @@ def get_results_dataframe(batch: Batch, include_raw: bool = False) -> pd.DataFra
                 row[f"{analyte_name} [IS Ratio]"] = sample.is_corrected_intensities.get(analyte_name, None)
                 
             row[f"{analyte_name} [Instr Conc]"] = sample.instrument_concentrations.get(analyte_name, None)
+            if sample.blank_corrected_concentrations:
+                row[f"{analyte_name} [Blank-Corr]"] = sample.blank_corrected_concentrations.get(analyte_name, None)
             row[f"{analyte_name} [Final Conc]"] = sample.final_concentrations.get(analyte_name, None)
             
         data.append(row)
@@ -118,6 +122,20 @@ def get_calibration_summary(processor: Processor) -> pd.DataFrame:
         
     return pd.DataFrame(data)
 
+def _get_loq_format_and_decimals(loq_val: Optional[float]) -> tuple:
+    """Returns number format string (e.g. '0.00' or '0.000') and integer decimals based on LoQ."""
+    if loq_val is None or loq_val <= 0:
+        return "0.00", 2
+    import math
+    try:
+        mag = -int(math.floor(math.log10(loq_val)))
+        decimals = max(2, mag)
+    except (ValueError, OverflowError):
+        decimals = 2
+    fmt = "0." + "0" * decimals
+    return fmt, decimals
+
+
 def export_excel_formula_report(
     batch: Batch,
     output_path: Optional[Union[str, Path]] = None,
@@ -127,6 +145,9 @@ def export_excel_formula_report(
     sheet_title: str = "Analytical_Report",
     report_title: Optional[str] = None,
     unit: Optional[str] = None,
+    weighting: Optional[str] = None,
+    decimals: Optional[Union[int, Dict[str, int]]] = None,
+    include_raw_cps: bool = False,
     workbook: Optional[Any] = None,
     return_metadata: bool = False,
 ) -> Any:
@@ -144,6 +165,11 @@ def export_excel_formula_report(
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
     loq_dict = instrument_loqs or {}
+
+    # Ensure internal standard ratios are calculated if not already processed
+    has_is = any(bool(s.is_corrected_intensities) for s in batch.samples)
+    if not has_is:
+        Processor(batch).perform_is_correction()
 
     # 1. Determine target analytes
     if analytes:
@@ -170,7 +196,14 @@ def export_excel_formula_report(
     for s in batch.samples:
         has_known = any(a in s.known_concentrations for a in target_analytes)
         is_std_type = s.sample_type in (SampleType.STANDARD, SampleType.BLANK)
-        if has_known and is_std_type:
+        # Check if specified in batch.analyte_calibration_standards
+        is_in_custom_stds = False
+        for a in target_analytes:
+            std_ids = batch.analyte_calibration_standards.get(a)
+            if std_ids and (s.sample_id in std_ids or s.sample_name in std_ids or s.data_file in std_ids):
+                is_in_custom_stds = True
+                break
+        if (has_known and is_std_type) or is_in_custom_stds:
             cal_samples.append(s)
             cal_sample_ids.add(s.sample_id)
 
@@ -259,7 +292,16 @@ def export_excel_formula_report(
             nom_col = 3 + a_idx * 2
             ratio_col = 4 + a_idx * 2
 
-            if a in s.known_concentrations:
+            std_ids = batch.analyte_calibration_standards.get(a)
+            is_std_for_a = True
+            if std_ids is not None:
+                is_std_for_a = (
+                    s.sample_id in std_ids
+                    or (s.sample_name is not None and s.sample_name in std_ids)
+                    or (s.data_file is not None and s.data_file in std_ids)
+                )
+
+            if a in s.known_concentrations and is_std_for_a:
                 analyte_std_rows[a].append(r)
                 nom_conc = s.known_concentrations[a]
                 ratio_val = s.is_corrected_intensities.get(a, 0.0)
@@ -295,6 +337,18 @@ def export_excel_formula_report(
     rsq_cells: Dict[str, str] = {}
     loq_cells: Dict[str, str] = {}
 
+    r_slope = cal_end_row + 1
+    r_intercept = cal_end_row + 2
+    r_rsq = cal_end_row + 3
+    r_loq = cal_end_row + 4
+
+    for a_idx, a in enumerate(target_analytes):
+        rat_col_letter = get_column_letter(4 + a_idx * 2)
+        slope_cells[a] = f"${rat_col_letter}${r_slope}"
+        intercept_cells[a] = f"${rat_col_letter}${r_intercept}"
+        rsq_cells[a] = f"${rat_col_letter}${r_rsq}"
+        loq_cells[a] = f"${rat_col_letter}${r_loq}"
+
     for p_idx, (lbl, num_fmt) in enumerate(param_labels):
         r = cal_end_row + 1 + p_idx
         c_lbl = ws.cell(row=r, column=1, value=lbl)
@@ -307,8 +361,10 @@ def export_excel_formula_report(
         ws.cell(row=r, column=2).border = cell_border
 
         for a_idx, a in enumerate(target_analytes):
-            nom_col_letter = get_column_letter(3 + a_idx * 2)
-            rat_col_letter = get_column_letter(4 + a_idx * 2)
+            nom_col_idx = 3 + a_idx * 2
+            rat_col_idx = 4 + a_idx * 2
+            nom_col_letter = get_column_letter(nom_col_idx)
+            rat_col_letter = get_column_letter(rat_col_idx)
 
             # Determine row range for analyte 'a'
             rows_for_a = analyte_std_rows[a]
@@ -319,23 +375,37 @@ def export_excel_formula_report(
                 a_start_r = cal_start_row
                 a_end_r = cal_end_row
 
-            c_val = ws.cell(row=r, column=4 + a_idx * 2)
-            c_blank = ws.cell(row=r, column=3 + a_idx * 2)
+            c_val = ws.cell(row=r, column=rat_col_idx)
+            c_blank = ws.cell(row=r, column=nom_col_idx)
             c_blank.fill = fill_param
             c_blank.border = cell_border
 
+            a_wt = getattr(batch, "analyte_weightings", {}).get(a, weighting or "none")
+
             if p_idx == 0:  # Slope
-                c_val.value = f"=SLOPE({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
-                slope_cells[a] = f"${rat_col_letter}${r}"
+                if a_wt == "blank_offset":
+                    c_val.value = f"=SUMPRODUCT({nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r}, {rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r} - {intercept_cells[a]}) / SUMSQ({nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
+                else:
+                    c_val.value = f"=SLOPE({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
             elif p_idx == 1:  # Intercept
-                c_val.value = f"=INTERCEPT({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
-                intercept_cells[a] = f"${rat_col_letter}${r}"
+                if a_wt == "blank_offset":
+                    zero_rows = [zr for zr in rows_for_a if ws.cell(row=zr, column=nom_col_idx).value == 0.0]
+                    if zero_rows:
+                        if len(zero_rows) == 1:
+                            c_val.value = f"={rat_col_letter}{zero_rows[0]}"
+                        else:
+                            c_val.value = f"=AVERAGE({rat_col_letter}{zero_rows[0]}:{rat_col_letter}{zero_rows[-1]})"
+                    else:
+                        c_val.value = f"=INTERCEPT({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
+                else:
+                    c_val.value = f"=INTERCEPT({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
             elif p_idx == 2:  # R2
-                c_val.value = f"=RSQ({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
-                rsq_cells[a] = f"${rat_col_letter}${r}"
+                if a_wt == "blank_offset":
+                    c_val.value = f"=1 - SUMPRODUCT(({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r} - ({slope_cells[a]}*{nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r} + {intercept_cells[a]}))^2) / DEVSQ({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r})"
+                else:
+                    c_val.value = f"=RSQ({rat_col_letter}{a_start_r}:{rat_col_letter}{a_end_r}, {nom_col_letter}{a_start_r}:{nom_col_letter}{a_end_r})"
             elif p_idx == 3:  # LoQ
                 c_val.value = float(loq_dict.get(a, 0.1))
-                loq_cells[a] = f"${rat_col_letter}${r}"
 
             c_val.font = font_bold
             c_val.fill = fill_param
@@ -411,10 +481,13 @@ def export_excel_formula_report(
         c.alignment = align_center
 
     # First pass: map method blank rows
+    mblk_rows: Dict[Optional[str], List[int]] = {}
     for s_idx, s in enumerate(target_samples):
         r = sample_start_row + s_idx
         if s.sample_type == SampleType.METHOD_BLANK:
-            mblk_rows[s.prep_group] = r
+            if s.prep_group not in mblk_rows:
+                mblk_rows[s.prep_group] = []
+            mblk_rows[s.prep_group].append(r)
 
     # Second pass: write sample rows and formulas
     for s_idx, s in enumerate(target_samples):
@@ -438,9 +511,7 @@ def export_excel_formula_report(
             c_hum.number_format = "0.0"
             c_hum.alignment = align_right
 
-            # Display volume in mL: if stored in L (<= 1.0), convert to mL for readability
-            vol_val = s.final_volume * 1000.0 if s.final_volume <= 1.0 else s.final_volume
-            c_vol = ws.cell(row=r, column=7, value=vol_val)
+            c_vol = ws.cell(row=r, column=7, value=s.final_volume)
             c_vol.number_format = "#,##0.0"
             c_vol.alignment = align_right
 
@@ -468,10 +539,14 @@ def export_excel_formula_report(
             # 3. Blank-Correction (if applicable)
             active_conc_let = instr_col_let
             if "blank_corr" in cols:
-                blank_r = mblk_rows.get(s.prep_group)
+                blank_row_list = mblk_rows.get(s.prep_group, [])
                 bcorr_col_let = get_column_letter(cols["blank_corr"])
-                if blank_r and not is_blank_sample:
-                    ws.cell(row=r, column=cols["blank_corr"], value=f"={instr_col_let}{r}-${instr_col_let}${blank_r}")
+                if blank_row_list and not is_blank_sample:
+                    if len(blank_row_list) == 1:
+                        ws.cell(row=r, column=cols["blank_corr"], value=f"={instr_col_let}{r}-${instr_col_let}${blank_row_list[0]}")
+                    else:
+                        mblk_cell_refs = ",".join(f"${instr_col_let}${br}" for br in blank_row_list)
+                        ws.cell(row=r, column=cols["blank_corr"], value=f"={instr_col_let}{r}-AVERAGE({mblk_cell_refs})")
                 else:
                     ws.cell(row=r, column=cols["blank_corr"], value=f"={instr_col_let}{r}")
                 c_bcorr = ws.cell(row=r, column=cols["blank_corr"])
@@ -569,11 +644,21 @@ def export_excel_formula_report(
             final_col_let = get_column_letter(cols["final_conc"])
             loq_col_let = get_column_letter(cols["sample_loq"])
 
+            a_loq = float(loq_dict.get(a, 0.1))
+            if isinstance(decimals, dict):
+                a_dec = decimals.get(a, _get_loq_format_and_decimals(a_loq)[1])
+                fmt_str = "0." + "0" * a_dec
+            elif isinstance(decimals, int):
+                a_dec = decimals
+                fmt_str = "0." + "0" * a_dec
+            else:
+                fmt_str, a_dec = _get_loq_format_and_decimals(a_loq)
+
             # Formula referencing Section 2's Final Conc and Sample LoQ
             c_val = ws.cell(
                 row=r_client,
                 column=2 + a_idx,
-                value=f'=IF({final_col_let}{r_proc}<{loq_col_let}{r_proc}, "< " & TEXT({loq_col_let}{r_proc}, "0.00"), ROUND({final_col_let}{r_proc}, 2))'
+                value=f'=IF({final_col_let}{r_proc}<{loq_col_let}{r_proc}, "< " & TEXT({loq_col_let}{r_proc}, "{fmt_str}"), ROUND({final_col_let}{r_proc}, {a_dec}))'
             )
             c_val.font = font_rep
             c_val.alignment = align_right
@@ -720,6 +805,8 @@ def export_split_dilution_report(
     low_samples: Optional[List[str]] = None,
     high_units: str = "mg/L",
     low_units: str = "ug/L",
+    weighting: Optional[str] = None,
+    decimals: Optional[Union[int, Dict[str, int]]] = None,
     report_title: Optional[str] = None,
     exclude_washes: bool = True,
 ) -> Path:
@@ -761,6 +848,8 @@ def export_split_dilution_report(
         sheet_title="Analitos Altos",
         report_title=title_high,
         unit=high_units,
+        weighting=weighting,
+        decimals=decimals,
         instrument_loqs=instrument_loqs,
         return_metadata=True,
     )
@@ -774,6 +863,8 @@ def export_split_dilution_report(
         sheet_title="Analitos Bajos",
         report_title=title_low,
         unit=low_units,
+        weighting=weighting,
+        decimals=decimals,
         instrument_loqs=instrument_loqs,
         workbook=wb,
         return_metadata=True,

@@ -567,3 +567,244 @@ def test_excel_formulas_piecewise_calibration(tmp_path):
     assert "6:D8" in cr_slope_f
     assert "9:F10" in pb_slope_f
 
+
+def _evaluate_with_libreoffice(xlsx_path: Path) -> openpyxl.Workbook:
+    """Evaluates formulas in an Excel file using headless LibreOffice."""
+    import subprocess
+    import shutil
+
+    if not shutil.which("libreoffice"):
+        pytest.skip("libreoffice not available for headless formula evaluation")
+
+    td = xlsx_path.parent / f"eval_{xlsx_path.stem}"
+    td.mkdir(exist_ok=True)
+    ods_path = td / (xlsx_path.stem + ".ods")
+
+    subprocess.run(
+        ["libreoffice", "--headless", "--convert-to", "ods", "--outdir", str(td), str(xlsx_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["libreoffice", "--headless", "--convert-to", "xlsx", str(ods_path), "--outdir", str(td)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return openpyxl.load_workbook(td / xlsx_path.name, data_only=True)
+
+
+def test_sample_invariants_validation():
+    """Verify that Sample raises ValueError on invalid physical parameters."""
+    with pytest.raises(ValueError, match="mass must be positive"):
+        Sample("S", SampleType.UNKNOWN, mass=0)
+
+    with pytest.raises(ValueError, match="mass must be positive"):
+        Sample("S", SampleType.UNKNOWN, mass=-0.5)
+
+    with pytest.raises(ValueError, match="Final volume must be positive"):
+        Sample("S", SampleType.UNKNOWN, final_volume=0)
+
+    with pytest.raises(ValueError, match="Dilution factor must be positive"):
+        Sample("S", SampleType.UNKNOWN, dilution_factor=0)
+
+    with pytest.raises(ValueError, match="Percent humidity must be in range"):
+        Sample("S", SampleType.UNKNOWN, percent_humidity=-1.0)
+
+    with pytest.raises(ValueError, match="Percent humidity must be in range"):
+        Sample("S", SampleType.UNKNOWN, percent_humidity=100.0)
+
+
+def test_excel_formulas_blank_offset_numerical_parity(tmp_path):
+    """Verify blank_offset formula generation and exact numerical parity with Processor."""
+    batch = Batch(name="BlankOffsetBatch")
+    batch.add_analyte(Analyte("Cr52", "Cr", 52))
+    batch.add_analyte(Analyte("Sc45", "Sc", 45, is_internal_standard=True))
+    batch.analyte_to_is["Cr52"] = "Sc45"
+
+    _build_calibration_standards(batch, ["Cr52"], [0.0, 10.0, 50.0, 100.0])
+
+    u = Sample(
+        sample_id="SAMPLE_BO",
+        sample_type=SampleType.UNKNOWN,
+        matrix=SampleMatrix.LIQUID,
+        dilution_factor=2.0,
+        raw_intensities={"Cr52": 1500.0, "Sc45": 50000.0},
+    )
+    batch.add_sample(u)
+
+    proc = Processor(batch, weighting="blank_offset")
+    proc.process()
+
+    out_xlsx = tmp_path / "blank_offset_report.xlsx"
+    export_excel_formula_report(
+        batch=batch,
+        output_path=out_xlsx,
+        analytes=["Cr52"],
+        weighting="blank_offset",
+    )
+
+    wb_raw = openpyxl.load_workbook(out_xlsx, data_only=False)
+    ws_raw = wb_raw.active
+
+    # Row 10: Slope, Row 11: Intercept, Row 12: R2
+    slope_f = str(ws_raw.cell(row=10, column=4).value)
+    int_f = str(ws_raw.cell(row=11, column=4).value)
+    rsq_f = str(ws_raw.cell(row=12, column=4).value)
+
+    assert "SUMPRODUCT" in slope_f
+    assert "SUMSQ" in slope_f
+    assert int_f == "=D6"  # Row 6 is S0 (blank)
+    assert "DEVSQ" in rsq_f
+
+    # Evaluate with LibreOffice Calc and verify exact parity
+    wb_eval = _evaluate_with_libreoffice(out_xlsx)
+    ws_eval = wb_eval.active
+
+    model = proc.calibration_models["Cr52"]
+    eval_slope = float(ws_eval.cell(row=10, column=4).value)
+    eval_intercept = float(ws_eval.cell(row=11, column=4).value)
+    eval_rsq = float(ws_eval.cell(row=12, column=4).value)
+
+    assert eval_slope == pytest.approx(model.slope, rel=1e-5)
+    assert eval_intercept == pytest.approx(model.intercept, rel=1e-5)
+    assert eval_rsq == pytest.approx(model.r_squared, rel=1e-4)
+
+    # Check evaluated final concentration
+    eval_final = float(ws_eval.cell(row=16, column=8).value)
+    assert eval_final == pytest.approx(u.final_concentrations["Cr52"], rel=1e-4)
+
+
+def test_excel_formulas_multiple_method_blanks_averaging(tmp_path):
+    """Verify that multiple method blanks in the same prep_group are averaged in Excel."""
+    batch = Batch(name="MultiMblkBatch")
+    batch.add_analyte(Analyte("Pb208", "Pb", 208))
+    batch.add_analyte(Analyte("Rh103", "Rh", 103, is_internal_standard=True))
+    batch.analyte_to_is["Pb208"] = "Rh103"
+
+    _build_calibration_standards(batch, ["Pb208"], [0.0, 10.0, 50.0])
+
+    # Two method blanks in BATCH_M
+    # MBLK 1: ratio = 0.005 -> conc ~ 0.08 ug/L
+    mb1 = Sample(
+        sample_id="MBLK_1",
+        sample_type=SampleType.METHOD_BLANK,
+        prep_group="BATCH_M",
+        matrix=SampleMatrix.SOLID,
+        mass=0.5,
+        final_volume=50.0,
+        raw_intensities={"Pb208": 250.0, "Rh103": 50000.0},
+    )
+    # MBLK 2: ratio = 0.010 -> conc ~ 0.18 ug/L
+    mb2 = Sample(
+        sample_id="MBLK_2",
+        sample_type=SampleType.METHOD_BLANK,
+        prep_group="BATCH_M",
+        matrix=SampleMatrix.SOLID,
+        mass=0.5,
+        final_volume=50.0,
+        raw_intensities={"Pb208": 500.0, "Rh103": 50000.0},
+    )
+    # Unknown in BATCH_M
+    unk = Sample(
+        sample_id="SAMPLE_SOLID",
+        sample_type=SampleType.UNKNOWN,
+        prep_group="BATCH_M",
+        matrix=SampleMatrix.SOLID,
+        mass=0.5,
+        final_volume=50.0,
+        dilution_factor=2.0,
+        raw_intensities={"Pb208": 5000.0, "Rh103": 50000.0},
+    )
+    batch.add_sample(mb1)
+    batch.add_sample(mb2)
+    batch.add_sample(unk)
+
+    proc = Processor(batch)
+    proc.process()
+
+    out_xlsx = tmp_path / "multi_mblk_report.xlsx"
+    export_excel_formula_report(
+        batch=batch,
+        output_path=out_xlsx,
+        analytes=["Pb208"],
+    )
+
+    wb_raw = openpyxl.load_workbook(out_xlsx, data_only=False)
+    ws_raw = wb_raw.active
+
+    # Sample is at row 17. Blank-Corr formula must contain AVERAGE of both MBLK rows
+    bcorr_formula = str(ws_raw.cell(row=17, column=10).value)
+    assert "AVERAGE(" in bcorr_formula
+    assert "$I$15" in bcorr_formula
+    assert "$I$16" in bcorr_formula
+
+    # Numerical verification via LibreOffice
+    wb_eval = _evaluate_with_libreoffice(out_xlsx)
+    ws_eval = wb_eval.active
+
+    eval_final = float(ws_eval.cell(row=17, column=12).value)
+    assert eval_final == pytest.approx(unk.final_concentrations["Pb208"], rel=1e-4)
+
+
+def test_excel_formulas_numerical_ground_truth_parity(tmp_path):
+    """Full end-to-end numerical check: verify 0 Excel errors and full parity with Python."""
+    batch = Batch(name="ParityBatch")
+    batch.add_analyte(Analyte("Cu63", "Cu", 63))
+    batch.add_analyte(Analyte("Sc45", "Sc", 45, is_internal_standard=True))
+    batch.analyte_to_is["Cu63"] = "Sc45"
+
+    _build_calibration_standards(batch, ["Cu63"], [0.0, 10.0, 50.0, 100.0])
+
+    s_liq = Sample(
+        sample_id="LIQ_SAMPLE",
+        sample_type=SampleType.UNKNOWN,
+        matrix=SampleMatrix.LIQUID,
+        dilution_factor=5.0,
+        raw_intensities={"Cu63": 3000.0, "Sc45": 50000.0},
+    )
+    s_sol = Sample(
+        sample_id="SOL_SAMPLE",
+        sample_type=SampleType.UNKNOWN,
+        matrix=SampleMatrix.SOLID,
+        mass=0.5000,
+        final_volume=50.0,
+        percent_humidity=15.0,
+        dilution_factor=2.0,
+        raw_intensities={"Cu63": 8000.0, "Sc45": 50000.0},
+    )
+    batch.add_sample(s_liq)
+    batch.add_sample(s_sol)
+
+    proc = Processor(batch)
+    proc.process()
+
+    out_xlsx = tmp_path / "parity_report.xlsx"
+    export_excel_formula_report(
+        batch=batch,
+        output_path=out_xlsx,
+        analytes=["Cu63"],
+        instrument_loqs={"Cu63": 0.05},
+    )
+
+    wb_eval = _evaluate_with_libreoffice(out_xlsx)
+    ws_eval = wb_eval.active
+
+    # 1. Ensure NO error codes exist in any cell
+    for row in ws_eval.iter_rows(values_only=True):
+        for cell_val in row:
+            val_str = str(cell_val or "")
+            for err_tag in ["#VALUE!", "#REF!", "#DIV/0!", "#NAME?", "#N/A", "Err:"]:
+                assert err_tag not in val_str, f"Found Excel error {err_tag} in cell value: {val_str}"
+
+    # 2. Check parity of final concentrations
+    # Row 16: Liquid sample -> Col 11
+    eval_liq = float(ws_eval.cell(row=16, column=11).value)
+    assert eval_liq == pytest.approx(s_liq.final_concentrations["Cu63"], rel=1e-4)
+
+    # Row 17: Solid sample -> Col 11
+    eval_sol = float(ws_eval.cell(row=17, column=11).value)
+    assert eval_sol == pytest.approx(s_sol.final_concentrations["Cu63"], rel=1e-4)
+
+

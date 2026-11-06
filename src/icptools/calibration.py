@@ -88,5 +88,5 @@ class CalibrationModel:
     def calculate_concentration(self, is_corrected_intensity: float) -> float:
         """Converts an IS-corrected intensity back to an instrument concentration."""
         if not self.fit_successful or self.slope == 0:
-            return 0.0
+            return float("nan")
         return (is_corrected_intensity - self.intercept) / self.slope
