@@ -13,11 +13,49 @@ class Processor:
 
     def process(self):
         """Runs the complete data processing pipeline."""
+        self.calculate_is_recoveries()
         self.perform_is_correction()
         self.calibrate()
         self.apply_calibration()
         self.perform_blank_subtraction()
         self.calculate_final_concentrations()
+
+    def calculate_is_recoveries(self):
+        """
+        Calculates % ISTD recovery for each sample and each internal standard
+        relative to the mean intensity of the calibration blank(s) (CalBlk).
+        """
+        # Find all internal standards in batch
+        istd_names = [name for name, a in self.batch.analytes.items() if a.is_internal_standard]
+        if not istd_names:
+            return
+
+        # Calculate baseline CPS from calibration blanks
+        cal_blks = [
+            s for s in self.batch.samples
+            if s.sample_type == SampleType.BLANK
+            or "calblk" in (s.sample_name or "").lower()
+            or "calblk" in (s.data_file or "").lower()
+        ]
+
+        baseline_is: Dict[str, float] = {}
+        for is_name in istd_names:
+            cps_list = [s.raw_intensities[is_name] for s in cal_blks if is_name in s.raw_intensities and s.raw_intensities[is_name] > 0]
+            if cps_list:
+                baseline_is[is_name] = sum(cps_list) / len(cps_list)
+            else:
+                # Fallback: first sample that has this ISTD
+                first_cps = next((s.raw_intensities[is_name] for s in self.batch.samples if is_name in s.raw_intensities and s.raw_intensities[is_name] > 0), None)
+                baseline_is[is_name] = first_cps if first_cps else 1.0
+
+        for sample in self.batch.samples:
+            for is_name in istd_names:
+                base = baseline_is.get(is_name, 0.0)
+                curr = sample.raw_intensities.get(is_name, 0.0)
+                if base > 0:
+                    sample.is_recovery[is_name] = (curr / base) * 100.0
+                else:
+                    sample.is_recovery[is_name] = 100.0
 
     def perform_is_correction(self):
         """Step 1: Normalizes analyte raw intensities by their assigned internal standard."""

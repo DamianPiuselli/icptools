@@ -24,6 +24,12 @@ from .parsers import (
     apply_sample_prep,
 )
 
+from .qc import (
+    QCEvaluator,
+    QCEvaluationResult,
+    get_qc_summary,
+)
+
 __all__ = [
     "Batch",
     "Sample",
@@ -44,4 +50,7 @@ __all__ = [
     "apply_calibration_table",
     "parse_sample_prep",
     "apply_sample_prep",
+    "QCEvaluator",
+    "QCEvaluationResult",
+    "get_qc_summary",
 ]

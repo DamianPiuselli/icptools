@@ -5,9 +5,11 @@ from typing import Dict, List, Optional
 class SampleType(Enum):
     STANDARD = "STD"
     BLANK = "BLK"  # Calibration Blank
-    QC = "QC"
+    QC = "QC"  # Quality Control / CCV / ICV / CRM
     UNKNOWN = "UNK"
     METHOD_BLANK = "MBLK"  # Digestion/Method Blank
+    DUPLICATE = "DUP"  # Analytical or field duplicate
+    SPIKE = "SPIKE"  # Matrix spike (MS)
 
 class SampleMatrix(Enum):
     LIQUID = "Liquid"
@@ -67,6 +69,12 @@ class Sample:
     
     # Calibration true concentrations (used for standard samples)
     known_concentrations: Dict[str, float] = field(default_factory=dict)
+    
+    # QA/QC metadata (ISO 17025)
+    expected_concentrations: Dict[str, float] = field(default_factory=dict)  # Target conc for QC/CRM/CCV
+    spike_concentrations: Dict[str, float] = field(default_factory=dict)  # Added spike concentration
+    parent_sample_id: Optional[str] = None  # Reference sample for DUP or SPIKE
+    is_recovery: Dict[str, float] = field(default_factory=dict)  # % ISTD recovery vs initial CalBlk
 
     # Instrument metadata
     sample_name: Optional[str] = None

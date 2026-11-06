@@ -148,6 +148,7 @@ def export_excel_formula_report(
     weighting: Optional[str] = None,
     decimals: Optional[Union[int, Dict[str, int]]] = None,
     include_raw_cps: bool = False,
+    include_qc_sheet: bool = False,
     workbook: Optional[Any] = None,
     return_metadata: bool = False,
 ) -> Any:
@@ -431,8 +432,6 @@ def export_excel_formula_report(
     vol_col_letter = get_column_letter(7) if has_solid else None
 
     # Determine which analytes have method blanks in this sample set
-    mblk_rows: Dict[tuple, int] = {}  # prep_group -> row_number
-
     # Pre-calculate column offsets for each analyte
     # Columns per analyte: [Ratio, Instr Conc, (optional Blank-Corr), Sample LoQ, Final Conc, Reported]
     analyte_col_info: Dict[str, Dict[str, int]] = {}
@@ -625,7 +624,7 @@ def export_excel_formula_report(
     # Filter for client samples only (exclude laboratory method blanks and QCs)
     client_samples = [
         (s_idx, s) for s_idx, s in enumerate(target_samples)
-        if s.sample_type not in (SampleType.METHOD_BLANK, SampleType.QC)
+        if s.sample_type not in (SampleType.METHOD_BLANK, SampleType.QC, SampleType.DUPLICATE, SampleType.SPIKE)
     ]
 
     # Write Client Report Rows (referencing Section 2 calculation cells)
@@ -663,6 +662,92 @@ def export_excel_formula_report(
             c_val.font = font_rep
             c_val.alignment = align_right
             c_val.border = cell_border
+
+    # -------------------------------------------------------------------------
+    # OPTIONAL: QA/QC CONTROL SHEET (ISO 17025)
+    # -------------------------------------------------------------------------
+    has_qc_samples = any(
+        s.sample_type in (SampleType.QC, SampleType.DUPLICATE, SampleType.SPIKE)
+        or bool(s.expected_concentrations)
+        or bool(s.spike_concentrations)
+        for s in batch.samples
+    )
+    if include_qc_sheet or has_qc_samples:
+        from .qc import QCEvaluator
+        evaluator = QCEvaluator(batch)
+        qc_results = evaluator.evaluate_all()
+
+        ws_qc = wb.create_sheet(title="Control de Calidad (QA-QC)")
+        ws_qc.views.sheetView[0].showGridLines = True
+
+        ws_qc.cell(row=1, column=1, value="CONTROL DE CALIDAD ANALÍTICO (ISO 17025 / QA-QC)").font = font_title
+        ws_qc.cell(row=2, column=1, value=f"Batch: {batch.name} | Evaluación de % ISTD, CCV/CRM, Duplicados y Spikes").font = font_sub
+
+        qc_headers = [
+            "Sample ID", "Sample Name", "QC Type", "Parameter", "Found",
+            "Target", "% Rec / RPD", "Lower Limit", "Upper Limit", "Status", "Details"
+        ]
+        qc_head_row = 4
+        for col_idx, h in enumerate(qc_headers, 1):
+            c = ws_qc.cell(row=qc_head_row, column=col_idx, value=h)
+            c.font = font_head
+            c.fill = fill_rep_head
+            c.border = sample_head_border
+            c.alignment = align_center
+
+        fill_pass = PatternFill("solid", fgColor="E2EFDA")  # Light green
+        fill_fail = PatternFill("solid", fgColor="FCE4D6")  # Light red
+        font_pass = Font(name="Calibri", size=10, bold=True, color="375623")
+        font_fail = Font(name="Calibri", size=10, bold=True, color="C65911")
+
+        for idx, res in enumerate(qc_results):
+            r = qc_head_row + 1 + idx
+            ws_qc.cell(row=r, column=1, value=res.sample_id).alignment = align_left
+            ws_qc.cell(row=r, column=2, value=res.sample_name).alignment = align_left
+            ws_qc.cell(row=r, column=3, value=res.qc_type).alignment = align_center
+            ws_qc.cell(row=r, column=4, value=res.parameter).alignment = align_center
+
+            c_fnd = ws_qc.cell(row=r, column=5, value=res.found_value)
+            c_fnd.number_format = "#,##0.00"
+            c_fnd.alignment = align_right
+
+            c_tgt = ws_qc.cell(row=r, column=6, value=res.target_value if res.target_value is not None else "")
+            if res.target_value is not None:
+                c_tgt.number_format = "#,##0.00"
+            c_tgt.alignment = align_right
+
+            c_rec = ws_qc.cell(row=r, column=7, value=res.recovery_or_rpd)
+            c_rec.number_format = "0.0"
+            c_rec.alignment = align_right
+
+            c_low = ws_qc.cell(row=r, column=8, value=res.lower_limit)
+            c_low.number_format = "0.0"
+            c_low.alignment = align_right
+
+            c_upp = ws_qc.cell(row=r, column=9, value=res.upper_limit)
+            c_upp.number_format = "0.0"
+            c_upp.alignment = align_right
+
+            c_stat = ws_qc.cell(row=r, column=10, value=res.status)
+            c_stat.alignment = align_center
+            if res.status == "PASS":
+                c_stat.fill = fill_pass
+                c_stat.font = font_pass
+            else:
+                c_stat.fill = fill_fail
+                c_stat.font = font_fail
+
+            ws_qc.cell(row=r, column=11, value=res.details).alignment = align_left
+
+            for col_i in range(1, len(qc_headers) + 1):
+                ws_qc.cell(row=r, column=col_i).border = cell_border
+                if col_i != 10:
+                    ws_qc.cell(row=r, column=col_i).font = font_reg
+
+        for col in ws_qc.columns:
+            col_letter = get_column_letter(col[0].column)
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            ws_qc.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
     # -------------------------------------------------------------------------
     # Auto-adjust column widths
