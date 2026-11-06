@@ -1,13 +1,20 @@
 import pytest
 from pathlib import Path
 from icptools import (
-    parse_agilent_counts,
+    Batch,
+    Sample,
+    Analyte,
     StandardMix,
     Processor,
     get_calibration_summary,
     generate_reports,
     SampleMatrix,
     SampleType,
+    parse_agilent_counts,
+    parse_agilent_calibration,
+    apply_calibration_table,
+    parse_sample_prep,
+    apply_sample_prep,
 )
 
 REAL_DATA_PATH = Path("local_data/20 y 22 -2026   pellets y lodos/fq count.xlsx")
@@ -273,6 +280,146 @@ def test_export_split_dilution_report(tmp_path):
     # Verify linking formula exists in unified table
     formula_val = ws_u.cell(row=5, column=2).value
     assert str(formula_val).startswith("='Analitos Altos'!")
+
+
+def test_parse_agilent_counts_multi_gas_and_rsds(tmp_path):
+    """Test multi-gas collision disambiguation and CPS RSD extraction."""
+    import pandas as pd
+    excel_file = tmp_path / "multi_gas_counts.xlsx"
+
+    # Multi-gas header: Fe measured in both [ No Gas ] and [ He ]
+    headers = [
+        "Sample", "Unnamed: 1", "Unnamed: 2", "Unnamed: 3", "Unnamed: 4", "Unnamed: 5", "Unnamed: 6", "Unnamed: 7", "Unnamed: 8",
+        "56  Fe  [ No Gas ] ", "Unnamed: 10",
+        "56  Fe  [ He ] ", "Unnamed: 12",
+        "45  Sc ( ISTD )  [ He ] ", "Unnamed: 14",
+    ]
+    row0 = [
+        None, "Rjct", "Data File", "Acq. Date-Time", "Type", "Level", "Sample Name", "Comment", "Dilution",
+        "CPS", "CPS RSD",
+        "CPS", "CPS RSD",
+        "CPS", "CPS RSD",
+    ]
+    row1 = [
+        None, False, "001SMPL.d", "2026-01-01", "Sample", None, "Sample_MultiGas", "x25", 25.0,
+        150000.0, 1.25,
+        12000.0, 0.85,
+        48000.0, 0.95,
+    ]
+
+    df = pd.DataFrame([row0, row1], columns=headers)
+    df.to_excel(excel_file, index=False)
+
+    batch = parse_agilent_counts(excel_file)
+    assert "Fe56_NoGas" in batch.analytes
+    assert "Fe56_He" in batch.analytes
+    assert "Sc45" in batch.analytes
+    assert batch.analytes["Sc45"].is_internal_standard is True
+
+    sample = batch.get_sample("Sample_MultiGas")
+    assert sample is not None
+    assert sample.dilution_factor == 25.0
+    assert sample.raw_intensities["Fe56_NoGas"] == 150000.0
+    assert sample.raw_intensities["Fe56_He"] == 12000.0
+    assert sample.raw_rsds["Fe56_NoGas"] == pytest.approx(1.25)
+    assert sample.raw_rsds["Fe56_He"] == pytest.approx(0.85)
+
+
+def test_parse_agilent_calibration_mixed_units_and_blank(tmp_path):
+    """Test unit normalization (ppm -> ug/L) and CalBlk without level number."""
+    import pandas as pd
+    cal_file = tmp_path / "mixed_cal.xlsx"
+
+    # Calibration table with Na in ppm (mg/L) and Cr in ppb (ug/L)
+    headers = ["Analyte", "ISTD", "Units", "Level 1", "Level 2", "Level 3"]
+    row0 = ["Name", "ISTD", "Units", "Level 1", "Level 2", "Level 3"]
+    row_na = ["Na", "Sc", "ppm", 0.0, 10.0, 50.0]  # 0, 10,000, 50,000 ug/L
+    row_cr = ["Cr", "Sc", "ppb", 0.0, 1.0, 20.0]   # 0, 1, 20 ug/L
+    df_cal = pd.DataFrame([row0, row_na, row_cr], columns=headers)
+    df_cal.to_excel(cal_file, index=False)
+
+    cal_data = parse_agilent_calibration(cal_file)
+    assert "Na" in cal_data
+    assert "Cr" in cal_data
+    # Check normalized concentrations in ug/L
+    assert cal_data["Na"]["levels"][1] == 0.0
+    assert cal_data["Na"]["levels"][2] == 10000.0  # 10 ppm * 1000 = 10,000 ug/L
+    assert cal_data["Na"]["levels"][3] == 50000.0  # 50 ppm * 1000 = 50,000 ug/L
+    assert cal_data["Cr"]["levels"][2] == 1.0
+    assert cal_data["Cr"]["levels"][3] == 20.0
+
+    # Build a batch with a CalBlk that has Level = None/NaN
+    batch = Batch(name="TestBatch")
+    batch.add_analyte(Analyte("Na23", "Na", 23))
+    batch.add_analyte(Analyte("Cr52", "Cr", 52))
+    batch.add_analyte(Analyte("Sc45", "Sc", 45, is_internal_standard=True))
+
+    s_blk = Sample(sample_id="001CALB", sample_type=SampleType.BLANK, sample_name="CalBlk", level=None)
+    s_std = Sample(sample_id="002CALS", sample_type=SampleType.UNKNOWN, sample_name="STD_1", level=2.0)
+    batch.add_sample(s_blk)
+    batch.add_sample(s_std)
+
+    apply_calibration_table(batch, cal_data)
+
+    assert s_blk.known_concentrations["Na23"] == 0.0
+    assert s_blk.known_concentrations["Cr52"] == 0.0
+    assert s_blk.sample_type == SampleType.BLANK
+
+    assert s_std.known_concentrations["Na23"] == 10000.0
+    assert s_std.known_concentrations["Cr52"] == 1.0
+    assert s_std.sample_type == SampleType.STANDARD
+
+
+def test_apply_sample_prep_excel_and_csv(tmp_path):
+    """Test importing sample prep metadata from CSV and Excel with Spanish column names."""
+    import pandas as pd
+    from icptools.parsers.prep import parse_sample_prep, apply_sample_prep
+
+    prep_csv = tmp_path / "sample_prep.csv"
+
+    # CSV with Spanish headers
+    prep_df = pd.DataFrame({
+        "Muestra": ["MUESTRA_01", "MUESTRA_02", "MBLK_SUELOS"],
+        "Matriz": ["Solida", "Solida", "Solida"],
+        "Masa (g)": [0.5234, 0.4981, 0.5000],
+        "Volumen (mL)": [50.0, 50.0, 50.0],
+        "% Humedad": [18.5, 22.0, 0.0],
+        "Factor Dilución": [1.0, 5.0, 1.0],
+        "Lote": ["LOTE_01", "LOTE_01", "LOTE_01"],
+        "Tipo Muestra": ["Sample", "Sample", "Blanco Metodo"],
+    })
+    prep_df.to_csv(prep_csv, index=False)
+
+    parsed = parse_sample_prep(prep_csv)
+    assert len(parsed) == 3
+    assert "mass" in parsed.columns
+    assert "percent_humidity" in parsed.columns
+    assert "prep_group" in parsed.columns
+
+    # Apply to batch
+    batch = Batch(name="PrepBatch")
+    s1 = Sample("MUESTRA_01", SampleType.UNKNOWN, sample_name="MUESTRA_01")
+    s2 = Sample("MUESTRA_02", SampleType.UNKNOWN, sample_name="MUESTRA_02")
+    mb = Sample("MBLK_SUELOS", SampleType.UNKNOWN, sample_name="MBLK_SUELOS")
+    batch.add_sample(s1)
+    batch.add_sample(s2)
+    batch.add_sample(mb)
+
+    apply_sample_prep(batch, prep_csv)
+
+    assert s1.matrix == SampleMatrix.SOLID
+    assert s1.mass == pytest.approx(0.5234)
+    assert s1.percent_humidity == pytest.approx(18.5)
+    assert s1.final_volume == pytest.approx(50.0)
+    assert s1.dilution_factor == pytest.approx(1.0)
+    assert s1.prep_group == "LOTE_01"
+
+    assert s2.dilution_factor == pytest.approx(5.0)
+    assert s2.percent_humidity == pytest.approx(22.0)
+
+    assert mb.sample_type == SampleType.METHOD_BLANK
+    assert mb.prep_group == "LOTE_01"
+
 
 
 

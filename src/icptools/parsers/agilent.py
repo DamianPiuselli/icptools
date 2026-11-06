@@ -35,7 +35,8 @@ def parse_agilent_counts(
     file_path: Union[str, Path],
     sheet_name: Union[str, int] = "Sheet1",
     batch_name: Optional[str] = None,
-    is_mapping: Optional[Dict[str, str]] = None
+    is_mapping: Optional[Dict[str, str]] = None,
+    include_gas_mode: bool = False,
 ) -> Batch:
     """
     Parses an Agilent MassHunter exported Excel counts file into a Batch.
@@ -47,6 +48,9 @@ def parse_agilent_counts(
         is_mapping: Optional dictionary mapping analyte names (e.g. 'Cr52' or 'Cr')
                     to internal standard names (e.g. 'Sc45'). If not provided,
                     each analyte is paired to the internal standard with the nearest mass.
+        include_gas_mode: If True, forces gas mode suffix in analyte names (e.g. 'Fe56_He').
+                          If False (default), gas mode suffix is added only when necessary
+                          to disambiguate collisions (e.g. same isotope in 'He' and 'No Gas').
                     
     Returns:
         A populated Batch instance.
@@ -69,20 +73,41 @@ def parse_agilent_counts(
     meta_indices: Dict[str, int] = {}
     for i, col in enumerate(df.columns):
         lbl = str(row0.iloc[i]).strip() if pd.notna(row0.iloc[i]) else ""
-        if lbl in ("Rjct", "Data File", "Type", "Level", "Sample Name", "Comment", "Acq. Date-Time"):
+        if lbl in (
+            "Rjct", "Data File", "Type", "Level", "Sample Name", "Comment", "Acq. Date-Time",
+            "Dilution", "Total Dil.", "Dil. Factor", "Dil"
+        ):
             meta_indices[lbl] = i
 
-    # 2. Identify Analyte / ISTD columns (Row 0 must be 'CPS')
-    analyte_cols: Dict[int, tuple] = {}
+    # 2. Identify Analyte / ISTD columns (Row 0 must be 'CPS') and adjacent CPS RSD
+    raw_analyte_cols: Dict[int, tuple] = {}
+    rsd_cols: Dict[int, int] = {}
     for i, col in enumerate(df.columns):
         lbl = str(row0.iloc[i]).strip() if pd.notna(row0.iloc[i]) else ""
         if lbl == "CPS":
             parsed = _parse_analyte_header(str(col))
             if parsed:
-                analyte_cols[i] = parsed
+                raw_analyte_cols[i] = parsed
+                if i + 1 < len(df.columns):
+                    next_lbl = str(row0.iloc[i + 1]).strip() if pd.notna(row0.iloc[i + 1]) else ""
+                    if "rsd" in next_lbl.lower():
+                        rsd_cols[i] = i + 1
 
-    if not analyte_cols:
+    if not raw_analyte_cols:
         raise ValueError(f"No valid CPS analyte columns detected in {path}.")
+
+    # Disambiguate names when multi-gas collisions occur
+    from collections import Counter
+    name_counts = Counter(parsed[0] for parsed in raw_analyte_cols.values())
+
+    analyte_cols: Dict[int, tuple] = {}
+    for col_idx, (base_name, element, mass, is_istd, gas_mode) in raw_analyte_cols.items():
+        if (name_counts[base_name] > 1 or include_gas_mode) and gas_mode:
+            clean_gas = re.sub(r"\s+", "", gas_mode)
+            final_name = f"{base_name}_{clean_gas}"
+        else:
+            final_name = base_name
+        analyte_cols[col_idx] = (final_name, element, mass, is_istd, gas_mode)
 
     batch = Batch(name=batch_name or path.stem)
 
@@ -112,9 +137,12 @@ def parse_agilent_counts(
                 batch.analyte_to_is[analyte.name] = target_is
                 continue
 
-        # Fallback: assign to nearest ISTD by mass
-        if istd_analytes:
-            nearest_is = min(istd_analytes, key=lambda a: abs(a.mass - analyte.mass))
+        # Fallback: if analyte has a gas_mode, prefer ISTDs with the same gas_mode
+        matching_istds = [a for a in istd_analytes if a.gas_mode == analyte.gas_mode] if analyte.gas_mode else []
+        candidate_istds = matching_istds if matching_istds else istd_analytes
+
+        if candidate_istds:
+            nearest_is = min(candidate_istds, key=lambda a: abs(a.mass - analyte.mass))
             batch.analyte_to_is[analyte.name] = nearest_is.name
 
     # 5. Extract Sample rows
@@ -159,15 +187,28 @@ def parse_agilent_counts(
             sample_id = f"{base_id}_{clean_df}"
         seen_ids.add(sample_id)
 
-        # Determine dilution factor from comment if present (e.g. 'DIL 1.100' or 'DIL 1:100')
+        # Determine dilution factor: check explicit metadata column, then comment
         dil_factor = 1.0
-        if comment:
-            m_dil = re.search(r"DIL\s*1[.:/](\d+)", comment, re.IGNORECASE)
+        for dil_key in ("Dilution", "Total Dil.", "Dil. Factor", "Dil"):
+            if dil_key in meta_indices and pd.notna(row.iloc[meta_indices[dil_key]]):
+                try:
+                    val = float(row.iloc[meta_indices[dil_key]])
+                    if val > 0:
+                        dil_factor = val
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+        if dil_factor == 1.0 and comment:
+            # Matches: DIL 1.100, DIL 1:100, DIL 1/100, DIL 100, 1:100, 1/100, x100, DF 100
+            m_dil = re.search(r"(?:DIL\s*(?:1[.:/])?|1\s*[:/]|[xX]\s*|DF\s*)(\d+(?:\.\d+)?)", comment, re.IGNORECASE)
             if m_dil:
                 try:
-                    dil_factor = float(m_dil.group(1))
+                    val = float(m_dil.group(1))
+                    if val > 0:
+                        dil_factor = val
                 except ValueError:
-                    dil_factor = 1.0
+                    pass
 
         sample = Sample(
             sample_id=sample_id,
@@ -179,7 +220,7 @@ def parse_agilent_counts(
             dilution_factor=dil_factor
         )
 
-        # Extract CPS counts
+        # Extract CPS counts and CPS RSDs
         for col_idx, (name, element, mass, is_istd, gas_mode) in analyte_cols.items():
             val = row.iloc[col_idx]
             try:
@@ -187,6 +228,14 @@ def parse_agilent_counts(
             except (ValueError, TypeError):
                 cps = 0.0
             sample.raw_intensities[name] = max(0.0, cps)
+
+            if col_idx in rsd_cols:
+                rsd_val = row.iloc[rsd_cols[col_idx]]
+                try:
+                    rsd = float(rsd_val) if pd.notna(rsd_val) else 0.0
+                except (ValueError, TypeError):
+                    rsd = 0.0
+                sample.raw_rsds[name] = max(0.0, rsd)
 
         batch.add_sample(sample)
 
@@ -198,12 +247,13 @@ def parse_agilent_calibration(
 ) -> Dict[str, dict]:
     """
     Parses an Agilent MassHunter exported Calibration table Excel file (e.g. CAL.xlsx).
+    Normalizes known concentration levels to ug/L regardless of original unit in Excel (ppm, ppb, etc.).
     
     Returns a dict mapping element/analyte symbol to:
         {
             'istd': str or None,
             'units': str,
-            'levels': {level_num (int): conc (float)}
+            'levels': {level_num (int): conc_ug_per_L (float)}
         }
     """
     path = Path(file_path)
@@ -239,26 +289,53 @@ def parse_agilent_calibration(
 
     cal_data: Dict[str, dict] = {}
     for r in range(1, len(df)):
-        elem = str(df.iloc[r, analyte_col]).strip()
-        if not elem or elem.lower() == "nan":
+        elem_raw = str(df.iloc[r, analyte_col]).strip()
+        if not elem_raw or elem_raw.lower() == "nan":
             continue
+
+        # Extract element or isotope name: e.g. 'Cr', '52 Cr', 'Pb', '208 Pb'
+        m_elem = re.match(r"(?:(\d+)\s*)?([A-Za-z]+)", elem_raw)
+        if m_elem:
+            mass_str = m_elem.group(1)
+            elem_sym = m_elem.group(2)
+            elem_key = f"{elem_sym}{mass_str}" if mass_str else elem_sym
+        else:
+            elem_key = elem_raw
+            elem_sym = elem_raw
+
         istd = str(df.iloc[r, istd_col]).strip() if pd.notna(df.iloc[r, istd_col]) else None
-        units = str(df.iloc[r, units_col]).strip() if units_col is not None and pd.notna(df.iloc[r, units_col]) else "ug/L"
+        units_raw = str(df.iloc[r, units_col]).strip() if units_col is not None and pd.notna(df.iloc[r, units_col]) else "ug/L"
         
+        # Unit normalization factor to ug/L
+        unit_clean = units_raw.lower().replace(" ", "")
+        if unit_clean in ("ppm", "mg/l"):
+            unit_factor = 1000.0
+        elif unit_clean in ("ppb", "ug/l", "µg/l"):
+            unit_factor = 1.0
+        elif unit_clean in ("ppt", "ng/l"):
+            unit_factor = 0.001
+        elif unit_clean in ("%", "wt%"):
+            unit_factor = 10000000.0
+        else:
+            unit_factor = 1.0
+
         levels: Dict[int, float] = {}
         for lvl_num, c_idx in level_cols.items():
             val = df.iloc[r, c_idx]
             try:
                 if pd.notna(val):
-                    levels[lvl_num] = float(val)
+                    levels[lvl_num] = float(val) * unit_factor
             except (ValueError, TypeError):
                 pass
                 
-        cal_data[elem] = {
+        cal_entry = {
             "istd": istd,
-            "units": units,
+            "units": units_raw,
             "levels": levels
         }
+        cal_data[elem_key] = cal_entry
+        if elem_sym != elem_key:
+            cal_data[elem_sym] = cal_entry
 
     return cal_data
 
@@ -283,34 +360,60 @@ def apply_calibration_table(
     else:
         cal_data = calibration_data_or_file
 
+    def get_cal_entry(analyte: Analyte):
+        if analyte.name in cal_data:
+            return cal_data[analyte.name]
+        base = analyte.name.split("_")[0]
+        if base in cal_data:
+            return cal_data[base]
+        if analyte.element in cal_data:
+            return cal_data[analyte.element]
+        return None
+
     # 1. Update internal standards mapping if requested
     if override_is:
         for aname, analyte in batch.analytes.items():
             if analyte.is_internal_standard:
                 continue
-            elem = analyte.element
-            if elem in cal_data and cal_data[elem]["istd"]:
-                istd_elem = cal_data[elem]["istd"]
-                # Find matching internal standard analyte in batch
-                for is_name, is_analyte in batch.analytes.items():
-                    if is_analyte.is_internal_standard and is_analyte.element == istd_elem:
-                        batch.analyte_to_is[aname] = is_name
-                        break
+            entry = get_cal_entry(analyte)
+            if entry and entry["istd"]:
+                istd_elem = entry["istd"]
+                matching = [
+                    is_name for is_name, is_a in batch.analytes.items()
+                    if is_a.is_internal_standard and is_a.element == istd_elem
+                ]
+                if matching:
+                    same_gas = [m for m in matching if batch.analytes[m].gas_mode == analyte.gas_mode]
+                    batch.analyte_to_is[aname] = same_gas[0] if same_gas else matching[0]
 
-    # 2. Populate known_concentrations for standard samples
+    # 2. Populate known_concentrations for standard and blank samples
     for sample in batch.samples:
+        is_cal_blk = (
+            sample.sample_type == SampleType.BLANK
+            or "calblk" in (sample.sample_name or "").lower()
+            or "calblk" in (sample.data_file or "").lower()
+        )
+
         if sample.level is not None:
             lvl_num = int(sample.level)
             for aname, analyte in batch.analytes.items():
                 if analyte.is_internal_standard:
                     continue
-                elem = analyte.element
-                if elem in cal_data and lvl_num in cal_data[elem]["levels"]:
-                    conc = cal_data[elem]["levels"][lvl_num]
+                entry = get_cal_entry(analyte)
+                if entry and lvl_num in entry["levels"]:
+                    conc = entry["levels"][lvl_num]
                     sample.known_concentrations[aname] = conc
-            
-            # Update sample type if needed
-            if sample.sample_type == SampleType.UNKNOWN:
-                sample.sample_type = SampleType.BLANK if lvl_num == 1 else SampleType.STANDARD
+
+            # Set sample type based on whether known concentrations are 0.0 or > 0.0
+            if sample.sample_type in (SampleType.UNKNOWN, SampleType.STANDARD, SampleType.BLANK):
+                has_positive = any(c > 0.0 for c in sample.known_concentrations.values())
+                sample.sample_type = SampleType.STANDARD if has_positive else SampleType.BLANK
+
+        elif is_cal_blk:
+            # CalBlk without level number: set known conc to 0.0 for all analytes
+            sample.sample_type = SampleType.BLANK
+            for aname, analyte in batch.analytes.items():
+                if not analyte.is_internal_standard:
+                    sample.known_concentrations[aname] = 0.0
 
     return batch

@@ -30,6 +30,7 @@ class Sample:
     # Raw intensities in counts per second (CPS) for each analyte
     # Key: Analyte name (str), Value: CPS (float)
     raw_intensities: Dict[str, float] = field(default_factory=dict)
+    raw_rsds: Dict[str, float] = field(default_factory=dict)  # CPS Relative Standard Deviation (%)
     
     # Sample preparation metadata
     matrix: SampleMatrix = SampleMatrix.LIQUID

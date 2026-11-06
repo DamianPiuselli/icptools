@@ -32,6 +32,7 @@ Esta guía define las mejores prácticas, la arquitectura del dominio y los fluj
 | `parse_agilent_counts` | Parser de Excel exportado por Agilent MassHunter | Para importar cuentas CPS y metadatos de corridas reales |
 | `parse_agilent_calibration` | Parser de tabla `CAL.xlsx` de Agilent | Para extraer niveles de concentración y mapeo de ISTD |
 | `apply_calibration_table` | Asigna concentraciones conocidas a los calibradores | Vincula `CAL.xlsx` con el `Batch` |
+| `parse_sample_prep` / `apply_sample_prep` | Ingesta de pesadas, humedades y dilución | Para cargar planillas de preparación (.xlsx/.csv) en el `Batch` |
 | `Processor` | Motor del pipeline de cálculo | IS-correction $\rightarrow$ Calibración $\rightarrow$ Blancos $\rightarrow$ Prep Math |
 | `export_excel_formula_report` | Exportador nativo de Excel con fórmulas | Para generar la hoja analítica completa con fórmulas vivas |
 | `export_split_dilution_report` | Generador del reporte de 3 pestañas | Cuando se miden mayoritarios diluidos y trazas sin diluir |
@@ -199,6 +200,40 @@ export_excel_formula_report(batch, "reportes/Batch_Mixto.xlsx")
 ```
 
 El motor exportador activa automáticamente las columnas de preparación (`Mass`, `% Humidity`, `Vol`) y aplica la fórmula de líquido a las filas líquidas y la de sólido a las filas sólidas.
+
+---
+
+### Receta 5: Carga Automatizada de Planilla de Preparación (Pesadas y Humedades)
+
+En lugar de cargar masas y volúmenes muestra por muestra en código, se utiliza una planilla Excel o CSV de preparación de laboratorio (con columnas en español o inglés como `Muestra`, `Masa (g)`, `Volumen (mL)`, `% Humedad`, `Factor Dilución`, `Lote`, `Tipo Muestra`):
+
+```python
+from icptools import (
+    parse_agilent_counts,
+    parse_agilent_calibration,
+    apply_calibration_table,
+    apply_sample_prep,
+    Processor,
+    export_excel_formula_report,
+)
+
+# 1. Cargar datos del equipo y calibración
+batch = parse_agilent_counts("datos/FQ_COUNTS.xlsx")
+apply_calibration_table(batch, "datos/CAL.xlsx")
+
+# 2. Inyectar pesadas y preparación desde la planilla del laboratorio
+apply_sample_prep(batch, "datos/PLANILLA_PREPARACION.xlsx")
+
+# 3. Procesar y generar reporte
+proc = Processor(batch)
+proc.process()
+
+export_excel_formula_report(
+    batch=batch,
+    output_path="reportes/Reporte_Suelos_Automatizado.xlsx",
+    report_title="Control de Metales en Suelos y Sedimentos",
+)
+```
 
 ---
 
