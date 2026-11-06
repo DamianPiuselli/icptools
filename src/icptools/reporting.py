@@ -120,13 +120,16 @@ def get_calibration_summary(processor: Processor) -> pd.DataFrame:
 
 def export_excel_formula_report(
     batch: Batch,
-    output_path: Union[str, Path],
+    output_path: Optional[Union[str, Path]] = None,
     instrument_loqs: Optional[Dict[str, float]] = None,
     analytes: Optional[List[str]] = None,
     samples: Optional[List[str]] = None,
     sheet_title: str = "Analytical_Report",
     report_title: Optional[str] = None,
-) -> Path:
+    unit: Optional[str] = None,
+    workbook: Optional[Any] = None,
+    return_metadata: bool = False,
+) -> Any:
     """
     Exports a single-sheet, multi-element Excel workbook populated with live
     Excel formulas (SLOPE, INTERCEPT, RSQ, inverse prediction, dilution,
@@ -136,8 +139,9 @@ def export_excel_formula_report(
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
-    out_file = Path(output_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file = Path(output_path) if output_path else None
+    if out_file:
+        out_file.parent.mkdir(parents=True, exist_ok=True)
 
     loq_dict = instrument_loqs or {}
 
@@ -180,9 +184,13 @@ def export_excel_formula_report(
     has_solid = any(s.matrix == SampleMatrix.SOLID for s in target_samples)
 
     # Initialize Workbook
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = sheet_title[:31]  # Excel tab title max 31 chars
+    if workbook is None:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_title[:31]  # Excel tab title max 31 chars
+    else:
+        wb = workbook
+        ws = wb.create_sheet(title=sheet_title[:31])
     ws.views.sheetView[0].showGridLines = True
 
     # Styling definitions
@@ -360,7 +368,10 @@ def export_excel_formula_report(
     analyte_col_info: Dict[str, Dict[str, int]] = {}
     curr_col = meta_len + 1
 
-    unit_str = "mg/kg" if has_solid else "ug/L"
+    if unit is not None:
+        unit_str = unit
+    else:
+        unit_str = "mg/kg" if has_solid else "ug/L"
     has_method_blank = any(s.sample_type == SampleType.METHOD_BLANK for s in target_samples)
 
     for a in target_analytes:
@@ -478,8 +489,11 @@ def export_excel_formula_report(
                     value=f"=({inst_loq_ref}*({vol_col_letter}{r}/1000)*{dil_col_letter}{r})/({mass_col_letter}{r}*(1-{hum_col_letter}{r}/100))"
                 )
             else:
-                # Liquid Method LoQ: =Instr_LoQ * Dilution
-                ws.cell(row=r, column=cols["sample_loq"], value=f"={inst_loq_ref}*{dil_col_letter}{r}")
+                # Liquid Method LoQ
+                if unit_str == "mg/L":
+                    ws.cell(row=r, column=cols["sample_loq"], value=f"={inst_loq_ref}*{dil_col_letter}{r}/1000")
+                else:
+                    ws.cell(row=r, column=cols["sample_loq"], value=f"={inst_loq_ref}*{dil_col_letter}{r}")
             c_sloq = ws.cell(row=r, column=cols["sample_loq"])
             c_sloq.number_format = "#,##0.00"
             c_sloq.alignment = align_right
@@ -493,8 +507,11 @@ def export_excel_formula_report(
                     value=f"=(({active_conc_let}{r})*({vol_col_letter}{r}/1000)*{dil_col_letter}{r})/({mass_col_letter}{r}*(1-{hum_col_letter}{r}/100))"
                 )
             else:
-                # Liquid Final Conc: =Conc * Dilution
-                ws.cell(row=r, column=cols["final_conc"], value=f"={active_conc_let}{r}*{dil_col_letter}{r}")
+                # Liquid Final Conc
+                if unit_str == "mg/L":
+                    ws.cell(row=r, column=cols["final_conc"], value=f"={active_conc_let}{r}*{dil_col_letter}{r}/1000")
+                else:
+                    ws.cell(row=r, column=cols["final_conc"], value=f"={active_conc_let}{r}*{dil_col_letter}{r}")
             c_fconc = ws.cell(row=r, column=cols["final_conc"])
             c_fconc.number_format = "#,##0.00"
             c_fconc.alignment = align_right
@@ -541,7 +558,8 @@ def export_excel_formula_report(
         r_client = client_start_row + cl_idx
         r_proc = sample_start_row + s_idx
 
-        c_id = ws.cell(row=r_client, column=1, value=s.sample_id)
+        sample_label = s.sample_name if s.sample_name else s.sample_id
+        c_id = ws.cell(row=r_client, column=1, value=sample_label)
         c_id.alignment = align_left
         c_id.font = font_bold
         c_id.border = cell_border
@@ -573,6 +591,296 @@ def export_excel_formula_report(
                 val_str = "1234567.89"  # approximate formula output length
             max_len = max(max_len, len(val_str))
         ws.column_dimensions[col_letter].width = max(max_len + 3, 13)
+
+    if out_file:
+        wb.save(out_file)
+
+    meta = {
+        "sheet_title": ws.title,
+        "client_start_row": client_start_row,
+        "client_samples": [
+            (s.sample_name if s.sample_name else s.sample_id, client_start_row + cl_idx)
+            for cl_idx, (s_idx, s) in enumerate(client_samples)
+        ],
+        "target_analytes": target_analytes,
+        "sample_start_row": sample_start_row,
+    }
+
+    if return_metadata:
+        return wb, meta
+    if out_file:
+        return out_file
+    return wb
+
+def generate_split_dilution_report(
+    batch: Batch,
+    high_analytes: List[str],
+    low_analytes: List[str],
+    high_units: str = "mg/L",
+    low_units: str = "ug/L",
+    exclude_washes: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Generates 3 DataFrames for a batch processed with separate dilutions for
+    high-concentration and low-concentration (trace) elements:
+    1. 'Analitos Altos': High concentration elements from diluted samples (dilution_factor > 1).
+    2. 'Analitos Bajos': Low concentration elements from undiluted samples (dilution_factor == 1).
+    3. 'Reporte Unificado': Unified table matching sample names, combining high analytes and low analytes.
+    """
+    high_scale = 0.001 if high_units == "mg/L" else 1.0
+    low_scale = 0.001 if low_units == "mg/L" else 1.0
+
+    # 1. Filter samples
+    high_samples = [
+        s for s in batch.samples
+        if s.sample_type == SampleType.UNKNOWN
+        and s.dilution_factor > 1.0
+        and (not exclude_washes or "lavado" not in (s.sample_name or "").lower())
+    ]
+    low_samples = [
+        s for s in batch.samples
+        if s.sample_type == SampleType.UNKNOWN
+        and s.dilution_factor <= 1.0
+        and (not exclude_washes or "lavado" not in (s.sample_name or "").lower())
+    ]
+
+    # Sheet 1 DataFrame: Analitos Altos
+    rows_high = []
+    for s in high_samples:
+        row = {
+            "Muestra": s.sample_name or s.sample_id,
+            "Archivo": s.data_file,
+            "Factor Dilución": s.dilution_factor,
+        }
+        for a in high_analytes:
+            row[f"{a} [CPS]"] = s.raw_intensities.get(a, 0.0)
+            row[f"{a} [Instr Conc (ug/L)]"] = s.instrument_concentrations.get(a, 0.0)
+            row[f"{a} [Final ({high_units})]"] = s.final_concentrations.get(a, 0.0) * high_scale
+        rows_high.append(row)
+    df_high = pd.DataFrame(rows_high)
+
+    # Sheet 2 DataFrame: Analitos Bajos
+    rows_low = []
+    for s in low_samples:
+        row = {
+            "Muestra": s.sample_name or s.sample_id,
+            "Archivo": s.data_file,
+            "Factor Dilución": s.dilution_factor,
+        }
+        for a in low_analytes:
+            row[f"{a} [CPS]"] = s.raw_intensities.get(a, 0.0)
+            row[f"{a} [Instr Conc (ug/L)]"] = s.instrument_concentrations.get(a, 0.0)
+            row[f"{a} [Final ({low_units})]"] = s.final_concentrations.get(a, 0.0) * low_scale
+        rows_low.append(row)
+    df_low = pd.DataFrame(rows_low)
+
+    # Sheet 3 DataFrame: Reporte Unificado
+    high_map = {s.sample_name: s for s in high_samples}
+    low_map = {s.sample_name: s for s in low_samples}
+
+    # Distinct sample names preserving appearance order
+    all_names = []
+    for s in high_samples + low_samples:
+        name = s.sample_name or s.sample_id
+        if name not in all_names:
+            all_names.append(name)
+
+    rows_unified = []
+    for name in all_names:
+        row = {"Muestra": name}
+        s_h = high_map.get(name)
+        s_l = low_map.get(name)
+
+        for a in high_analytes:
+            elem = batch.analytes[a].element if a in batch.analytes else a
+            val = (s_h.final_concentrations.get(a, 0.0) * high_scale) if s_h else None
+            row[f"{elem} [{high_units}]"] = val
+
+        for a in low_analytes:
+            elem = batch.analytes[a].element if a in batch.analytes else a
+            val = (s_l.final_concentrations.get(a, 0.0) * low_scale) if s_l else None
+            row[f"{elem} [{low_units}]"] = val
+
+        rows_unified.append(row)
+    df_unified = pd.DataFrame(rows_unified)
+
+    return {
+        "Analitos Altos": df_high,
+        "Analitos Bajos": df_low,
+        "Reporte Unificado": df_unified,
+    }
+
+def export_split_dilution_report(
+    batch: Batch,
+    output_path: Union[str, Path],
+    high_analytes: List[str],
+    low_analytes: List[str],
+    instrument_loqs: Optional[Dict[str, float]] = None,
+    high_samples: Optional[List[str]] = None,
+    low_samples: Optional[List[str]] = None,
+    high_units: str = "mg/L",
+    low_units: str = "ug/L",
+    report_title: Optional[str] = None,
+    exclude_washes: bool = True,
+) -> Path:
+    """
+    Exports a 3-sheet Excel workbook using the native Excel formula report engine (export_excel_formula_report):
+    - Sheet 1: 'Analitos Altos' (Native Agilent report for diluted samples and high analytes)
+    - Sheet 2: 'Analitos Bajos' (Native Agilent report for undiluted samples and low analytes)
+    - Sheet 3: 'Reporte Unificado' (Consolidated client table linking directly to the client reports of sheets 1 and 2)
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    out_file = Path(output_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Filter samples if not provided
+    if high_samples is None:
+        high_samples = [
+            s.sample_id for s in batch.samples
+            if s.sample_type == SampleType.UNKNOWN
+            and s.dilution_factor > 1.0
+            and (not exclude_washes or "lavado" not in (s.sample_name or "").lower())
+        ]
+    if low_samples is None:
+        low_samples = [
+            s.sample_id for s in batch.samples
+            if s.sample_type == SampleType.UNKNOWN
+            and s.dilution_factor <= 1.0
+            and (not exclude_washes or "lavado" not in (s.sample_name or "").lower())
+        ]
+
+    # 1. Sheet 1: Analitos Altos using native export_excel_formula_report
+    title_high = f"{report_title or batch.name} - Analitos Altos (Muestras Diluidas)"
+    wb, meta_high = export_excel_formula_report(
+        batch=batch,
+        analytes=high_analytes,
+        samples=high_samples,
+        sheet_title="Analitos Altos",
+        report_title=title_high,
+        unit=high_units,
+        instrument_loqs=instrument_loqs,
+        return_metadata=True,
+    )
+
+    # 2. Sheet 2: Analitos Bajos using native export_excel_formula_report
+    title_low = f"{report_title or batch.name} - Analitos Bajos (Muestras Sin Diluir)"
+    wb, meta_low = export_excel_formula_report(
+        batch=batch,
+        analytes=low_analytes,
+        samples=low_samples,
+        sheet_title="Analitos Bajos",
+        report_title=title_low,
+        unit=low_units,
+        instrument_loqs=instrument_loqs,
+        workbook=wb,
+        return_metadata=True,
+    )
+
+    # 3. Sheet 3: Reporte Unificado linking to Section 3 (Final Client Report) of both sheets
+    ws_unif = wb.create_sheet(title="Reporte Unificado")
+    ws_unif.views.sheetView[0].showGridLines = True
+
+    font_title = Font(name="Calibri", size=13, bold=True, color="1F497D")
+    font_sub = Font(name="Calibri", size=10, italic=True, color="595959")
+    font_head = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    font_bold = Font(name="Calibri", size=10, bold=True)
+    font_rep = Font(name="Calibri", size=10, bold=True, color="1F497D")
+
+    fill_rep_head = PatternFill("solid", fgColor="366092")
+    thin_border = Side(border_style="thin", color="D9D9D9")
+    cell_border = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
+    sample_head_border = Border(
+        left=thin_border, right=thin_border, top=thin_border, bottom=Side(border_style="medium", color="243F60")
+    )
+
+    align_center = Alignment(horizontal="center", vertical="center")
+    align_left = Alignment(horizontal="left", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    ws_unif.cell(row=1, column=1, value=f"{report_title or batch.name} - Reporte Unificado Consolidado").font = font_title
+    ws_unif.cell(
+        row=2, column=1,
+        value=f"Batch: {batch.name} | Pestaña 3: Fusión de Analitos Altos (Dilución 1:100) y Analitos Bajos (Sin Diluir)"
+    ).font = font_sub
+
+    headers_unif = ["Sample ID"]
+    for a in high_analytes:
+        elem = batch.analytes[a].element if a in batch.analytes else a
+        headers_unif.append(f"{elem} ({high_units})")
+    for a in low_analytes:
+        elem = batch.analytes[a].element if a in batch.analytes else a
+        headers_unif.append(f"{elem} ({low_units})")
+
+    head_row_num = 4
+    for col_idx, h in enumerate(headers_unif, 1):
+        c = ws_unif.cell(row=head_row_num, column=col_idx, value=h)
+        c.font = font_head
+        c.fill = fill_rep_head
+        c.border = sample_head_border
+        c.alignment = align_center
+
+    high_row_map = {name: r for name, r in meta_high["client_samples"]}
+    low_row_map = {name: r for name, r in meta_low["client_samples"]}
+
+    all_names = list(
+        dict.fromkeys(
+            [name for name, _ in meta_high["client_samples"]]
+            + [name for name, _ in meta_low["client_samples"]]
+        )
+    )
+
+    client_start_row = 5
+    for idx, name in enumerate(all_names):
+        r = client_start_row + idx
+
+        c_id = ws_unif.cell(row=r, column=1, value=name)
+        c_id.alignment = align_left
+        c_id.font = font_bold
+        c_id.border = cell_border
+
+        # High analytes link to Section 3 of 'Analitos Altos' (already in high_units)
+        col_cursor = 2
+        r_high = high_row_map.get(name)
+        for a_idx, a in enumerate(high_analytes):
+            target_col_let = get_column_letter(2 + a_idx)
+            if r_high is not None:
+                formula = f"='Analitos Altos'!{target_col_let}{r_high}"
+                c_val = ws_unif.cell(row=r, column=col_cursor, value=formula)
+            else:
+                c_val = ws_unif.cell(row=r, column=col_cursor, value="")
+            c_val.font = font_rep
+            c_val.number_format = "#,##0.00" if high_units == "mg/L" else "#,##0"
+            c_val.alignment = align_right
+            c_val.border = cell_border
+            col_cursor += 1
+
+        # Low analytes link to Section 3 of 'Analitos Bajos'
+        r_low = low_row_map.get(name)
+        for b_idx, a in enumerate(low_analytes):
+            target_col_let = get_column_letter(2 + b_idx)
+            if r_low is not None:
+                formula = f"='Analitos Bajos'!{target_col_let}{r_low}"
+                c_val = ws_unif.cell(row=r, column=col_cursor, value=formula)
+            else:
+                c_val = ws_unif.cell(row=r, column=col_cursor, value="")
+            c_val.font = font_rep
+            c_val.number_format = "#,##0.000" if a in ("Cr52", "Ni60", "Cu63", "Cd111", "Pb208") else "#,##0.00"
+            c_val.alignment = align_right
+            c_val.border = cell_border
+            col_cursor += 1
+
+    for col in ws_unif.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = 0
+        for cell in col:
+            val_str = str(cell.value or "")
+            if val_str.startswith("="):
+                val_str = "12345.678"
+            max_len = max(max_len, len(val_str))
+        ws_unif.column_dimensions[col_letter].width = max(max_len + 3, 13)
 
     wb.save(out_file)
     return out_file

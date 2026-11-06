@@ -148,4 +148,132 @@ def test_export_excel_formula_report(tmp_path):
     assert any("RSQ" in str(f) for f in formulas_found)
     assert any("IF" in str(f) for f in formulas_found)
 
+def test_parse_calibration_and_blank_offset(tmp_path):
+    import pandas as pd
+    from icptools import (
+        parse_agilent_counts,
+        parse_agilent_calibration,
+        apply_calibration_table,
+        Processor,
+        SampleMatrix,
+    )
+
+    counts_file = tmp_path / "counts.xlsx"
+    cal_file = tmp_path / "cal.xlsx"
+
+    # 1. Mock CAL.xlsx
+    cal_cols = ["Analyte", "Unnamed: 1", "Unnamed: 2", "Unnamed: 3", "Level", "Unnamed: 5"]
+    row0_c = ["Name", "ISTD", "Min Conc.", "Units", "Level 1", "Level 2"]
+    row1_c = ["Cr", "Sc", 0, "ug/L", 0.0, 10.0]
+    df_cal = pd.DataFrame([row0_c, row1_c], columns=cal_cols)
+    df_cal.to_excel(cal_file, index=False)
+
+    # 2. Mock FQ COUNTS.xlsx
+    cnt_cols = [
+        "Sample", "Unnamed: 1", "Unnamed: 2", "Unnamed: 3", "Unnamed: 4", "Unnamed: 5", "Unnamed: 6", "Unnamed: 7", "Unnamed: 8",
+        "52  Cr  [ He ] ", "Unnamed: 10", "45  Sc ( ISTD )  [ He ] ", "Unnamed: 12"
+    ]
+    row0_cnt = [None, "Rjct", "Data File", "Acq. Date-Time", "Type", "Level", "Sample Name", "ISTD Conc.", "Comment", "CPS", "CPS RSD", "CPS", "CPS RSD"]
+    row1_cnt = [None, False, "001CALB.d", "2026-01-01", "CalBlk", 1.0, "S0", "Level1", None, 100.0, 1.0, 10000.0, 1.0] # ratio = 0.01
+    row2_cnt = [None, False, "002CALS.d", "2026-01-01", "CalStd", 2.0, "S1", "Level2", None, 1100.0, 1.0, 10000.0, 1.0] # ratio = 0.11 (slope = 0.01)
+    row3_cnt = [None, False, "003SMPL.d", "2026-01-01", "Sample", None, "Sample1", "Level1", "DIL 1.100", 600.0, 1.0, 10000.0, 1.0] # ratio = 0.06 -> net ratio = 0.05 -> conc = 5.0 -> diluted = 500.0
+    df_cnt = pd.DataFrame([row0_cnt, row1_cnt, row2_cnt, row3_cnt], columns=cnt_cols)
+    df_cnt.to_excel(counts_file, index=False)
+
+    cal_data = parse_agilent_calibration(cal_file)
+    assert "Cr" in cal_data
+    assert cal_data["Cr"]["levels"][1] == 0.0
+    assert cal_data["Cr"]["levels"][2] == 10.0
+
+    batch = parse_agilent_counts(counts_file)
+    apply_calibration_table(batch, cal_data)
+
+    s_unk = batch.get_sample("Sample1")
+    assert s_unk.dilution_factor == 100.0
+    assert batch.analyte_to_is["Cr52"] == "Sc45"
+
+    proc = Processor(batch, weighting="blank_offset")
+    proc.process()
+
+    model = proc.calibration_models["Cr52"]
+    assert model.fit_successful
+    assert model.intercept == pytest.approx(0.01)
+    assert model.slope == pytest.approx(0.01)
+    assert s_unk.instrument_concentrations["Cr52"] == pytest.approx(5.0)
+    assert s_unk.final_concentrations["Cr52"] == pytest.approx(500.0)
+
+def test_export_split_dilution_report(tmp_path):
+    import openpyxl
+    from icptools import (
+        Batch,
+        Sample,
+        Analyte,
+        SampleType,
+        export_split_dilution_report,
+        generate_split_dilution_report,
+    )
+
+    batch = Batch(name="TestSplit")
+    batch.add_analyte(Analyte("Na23", "Na", 23))
+    batch.add_analyte(Analyte("Cr52", "Cr", 52))
+
+    # Add high-dilution sample
+    s_high = Sample(
+        sample_id="SMPL1_dil",
+        sample_type=SampleType.UNKNOWN,
+        sample_name="SMPL1",
+        data_file="001SMPL.d",
+        dilution_factor=100.0,
+        instrument_concentrations={"Na23": 200.0, "Cr52": 0.0},
+        final_concentrations={"Na23": 20000.0, "Cr52": 0.0},
+    )
+    # Add undiluted sample
+    s_low = Sample(
+        sample_id="SMPL1_undil",
+        sample_type=SampleType.UNKNOWN,
+        sample_name="SMPL1",
+        data_file="002SMPL.d",
+        dilution_factor=1.0,
+        instrument_concentrations={"Na23": 20000.0, "Cr52": 1.5},
+        final_concentrations={"Na23": 20000.0, "Cr52": 1.5},
+    )
+    batch.add_sample(s_high)
+    batch.add_sample(s_low)
+
+    rep_dfs = generate_split_dilution_report(
+        batch=batch,
+        high_analytes=["Na23"],
+        low_analytes=["Cr52"],
+        high_units="mg/L",
+        low_units="ug/L",
+    )
+    assert "Analitos Altos" in rep_dfs
+    assert "Analitos Bajos" in rep_dfs
+    assert "Reporte Unificado" in rep_dfs
+    assert len(rep_dfs["Reporte Unificado"]) == 1
+    assert rep_dfs["Reporte Unificado"]["Na [mg/L]"].iloc[0] == pytest.approx(20.0)
+    assert rep_dfs["Reporte Unificado"]["Cr [ug/L]"].iloc[0] == pytest.approx(1.5)
+
+    out_xlsx = tmp_path / "split_report.xlsx"
+    export_split_dilution_report(
+        batch=batch,
+        output_path=out_xlsx,
+        high_analytes=["Na23"],
+        low_analytes=["Cr52"],
+        high_units="mg/L",
+        low_units="ug/L",
+    )
+    assert out_xlsx.exists()
+    wb = openpyxl.load_workbook(out_xlsx)
+    assert "Analitos Altos" in wb.sheetnames
+    assert "Analitos Bajos" in wb.sheetnames
+    assert "Reporte Unificado" in wb.sheetnames
+
+    ws_u = wb["Reporte Unificado"]
+    # Verify linking formula exists in unified table
+    formula_val = ws_u.cell(row=5, column=2).value
+    assert str(formula_val).startswith("='Analitos Altos'!")
+
+
+
 

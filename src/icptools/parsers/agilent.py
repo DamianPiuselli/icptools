@@ -159,13 +159,24 @@ def parse_agilent_counts(
             sample_id = f"{base_id}_{clean_df}"
         seen_ids.add(sample_id)
 
+        # Determine dilution factor from comment if present (e.g. 'DIL 1.100' or 'DIL 1:100')
+        dil_factor = 1.0
+        if comment:
+            m_dil = re.search(r"DIL\s*1[.:/](\d+)", comment, re.IGNORECASE)
+            if m_dil:
+                try:
+                    dil_factor = float(m_dil.group(1))
+                except ValueError:
+                    dil_factor = 1.0
+
         sample = Sample(
             sample_id=sample_id,
             sample_type=stype,
             sample_name=sample_name or sample_id,
             data_file=data_file,
             comment=comment,
-            level=level_val
+            level=level_val,
+            dilution_factor=dil_factor
         )
 
         # Extract CPS counts
@@ -178,5 +189,128 @@ def parse_agilent_counts(
             sample.raw_intensities[name] = max(0.0, cps)
 
         batch.add_sample(sample)
+
+    return batch
+
+def parse_agilent_calibration(
+    file_path: Union[str, Path],
+    sheet_name: Union[str, int] = "Sheet1"
+) -> Dict[str, dict]:
+    """
+    Parses an Agilent MassHunter exported Calibration table Excel file (e.g. CAL.xlsx).
+    
+    Returns a dict mapping element/analyte symbol to:
+        {
+            'istd': str or None,
+            'units': str,
+            'levels': {level_num (int): conc (float)}
+        }
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+        df = pd.read_excel(path, sheet_name=sheet_name)
+
+    if df.empty:
+        raise ValueError(f"Calibration spreadsheet at {path} is empty.")
+
+    # Identify header columns from row 0
+    row0 = df.iloc[0]
+    analyte_col = 0
+    istd_col = 1
+    units_col = None
+    level_cols: Dict[int, int] = {}
+    
+    for i, val in enumerate(row0):
+        val_str = str(val).strip()
+        if val_str.lower() == "name":
+            analyte_col = i
+        elif val_str.lower() == "istd":
+            istd_col = i
+        elif val_str.lower() == "units":
+            units_col = i
+        elif val_str.lower().startswith("level"):
+            parts = val_str.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                level_cols[int(parts[1])] = i
+
+    cal_data: Dict[str, dict] = {}
+    for r in range(1, len(df)):
+        elem = str(df.iloc[r, analyte_col]).strip()
+        if not elem or elem.lower() == "nan":
+            continue
+        istd = str(df.iloc[r, istd_col]).strip() if pd.notna(df.iloc[r, istd_col]) else None
+        units = str(df.iloc[r, units_col]).strip() if units_col is not None and pd.notna(df.iloc[r, units_col]) else "ug/L"
+        
+        levels: Dict[int, float] = {}
+        for lvl_num, c_idx in level_cols.items():
+            val = df.iloc[r, c_idx]
+            try:
+                if pd.notna(val):
+                    levels[lvl_num] = float(val)
+            except (ValueError, TypeError):
+                pass
+                
+        cal_data[elem] = {
+            "istd": istd,
+            "units": units,
+            "levels": levels
+        }
+
+    return cal_data
+
+def apply_calibration_table(
+    batch: Batch,
+    calibration_data_or_file: Union[str, Path, Dict[str, dict]],
+    override_is: bool = True
+) -> Batch:
+    """
+    Applies parsed calibration concentrations and internal standards to a Batch.
+    
+    Args:
+        batch: The Batch instance to calibrate.
+        calibration_data_or_file: A path to a CAL.xlsx file or the dictionary from parse_agilent_calibration.
+        override_is: If True, updates batch.analyte_to_is matching the ISTD in the cal table.
+        
+    Returns:
+        The updated Batch instance.
+    """
+    if isinstance(calibration_data_or_file, (str, Path)):
+        cal_data = parse_agilent_calibration(calibration_data_or_file)
+    else:
+        cal_data = calibration_data_or_file
+
+    # 1. Update internal standards mapping if requested
+    if override_is:
+        for aname, analyte in batch.analytes.items():
+            if analyte.is_internal_standard:
+                continue
+            elem = analyte.element
+            if elem in cal_data and cal_data[elem]["istd"]:
+                istd_elem = cal_data[elem]["istd"]
+                # Find matching internal standard analyte in batch
+                for is_name, is_analyte in batch.analytes.items():
+                    if is_analyte.is_internal_standard and is_analyte.element == istd_elem:
+                        batch.analyte_to_is[aname] = is_name
+                        break
+
+    # 2. Populate known_concentrations for standard samples
+    for sample in batch.samples:
+        if sample.level is not None:
+            lvl_num = int(sample.level)
+            for aname, analyte in batch.analytes.items():
+                if analyte.is_internal_standard:
+                    continue
+                elem = analyte.element
+                if elem in cal_data and lvl_num in cal_data[elem]["levels"]:
+                    conc = cal_data[elem]["levels"][lvl_num]
+                    sample.known_concentrations[aname] = conc
+            
+            # Update sample type if needed
+            if sample.sample_type == SampleType.UNKNOWN:
+                sample.sample_type = SampleType.BLANK if lvl_num == 1 else SampleType.STANDARD
 
     return batch

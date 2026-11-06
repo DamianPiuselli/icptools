@@ -55,13 +55,27 @@ class CalibrationModel:
             # Often analytical chemistry 1/x weighting means w_i = 1/x_i.
             weights = 1.0 / np.maximum(x, 1e-6)
             
-        if weights is not None:
+        if self.weighting == "blank_offset":
+            # Force/anchor intercept to the calibration blank (x == 0)
+            zero_indices = np.where(x == 0.0)[0]
+            if len(zero_indices) > 0:
+                self.intercept = float(np.mean(y[zero_indices]))
+            else:
+                coeffs = np.polyfit(x, y, deg=1)
+                self.intercept = float(coeffs[1])
+            denom = float(np.sum(x**2))
+            if denom > 0:
+                self.slope = float(np.sum(x * (y - self.intercept)) / denom)
+            else:
+                self.slope = 0.0
+        elif weights is not None:
             coeffs = np.polyfit(x, y, deg=1, w=weights)
+            self.slope = coeffs[0]
+            self.intercept = coeffs[1]
         else:
             coeffs = np.polyfit(x, y, deg=1)
-            
-        self.slope = coeffs[0]
-        self.intercept = coeffs[1]
+            self.slope = coeffs[0]
+            self.intercept = coeffs[1]
         
         # Calculate R^2
         y_fit = self.slope * x + self.intercept

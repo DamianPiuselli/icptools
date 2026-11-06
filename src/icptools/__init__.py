@@ -13,8 +13,14 @@ from .reporting import (
     get_results_dataframe,
     get_calibration_summary,
     export_excel_formula_report,
+    generate_split_dilution_report,
+    export_split_dilution_report,
 )
-from .parsers import parse_agilent_counts
+from .parsers import (
+    parse_agilent_counts,
+    parse_agilent_calibration,
+    apply_calibration_table,
+)
 
 __all__ = [
     "Batch",
@@ -29,5 +35,9 @@ __all__ = [
     "get_results_dataframe",
     "get_calibration_summary",
     "export_excel_formula_report",
+    "generate_split_dilution_report",
+    "export_split_dilution_report",
     "parse_agilent_counts",
+    "parse_agilent_calibration",
+    "apply_calibration_table",
 ]
