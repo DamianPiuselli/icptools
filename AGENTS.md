@@ -19,6 +19,9 @@ Esta guía define las mejores prácticas, la arquitectura del dominio y los fluj
 4. **Prevención de Errores `#VALUE!` en Excel**:
    * Cuando una concentración es inferior al límite de cuantificación ($\text{Conc} < \text{LoQ}$), el reporte de cliente evalúa una cadena de texto (ej. `"< 0.10"`).
    * **Regla para agentes**: Para cambiar unidades de $\mu\text{g/L}$ a $\text{mg/L}$, **nunca** dividas una celda de texto en Excel (`="< 0.10" / 1000`). En su lugar, usa el parámetro nativo `unit="mg/L"` en el exportador para que la conversión se aplique sobre las celdas numéricas de la Sección 2.
+5. **Co-localización de Scripts e Informes con los Datos (Trazabilidad y Procedencia)**:
+   * **Regla estricta para agentes**: Todo script de procesamiento en Python (`process_run.py` u homólogo) y el reporte generado (`.xlsx`) deben residir y guardarse directamente en la misma carpeta que contiene los archivos crudos de la corrida (`FQ_COUNTS.xlsx`, `CAL.xlsx`, planilla de pesadas).
+   * **Por qué**: Incluso cuando los informes Excel generados son autocontenidos y auditables mediante fórmulas nativas vivas, el script en Python constituye la documentación inequívoca de procedencia analítica (especifica qué modelo de calibración/ponderación se aplicó, qué LoQs instrumentales se definieron, qué asignación de diluciones se usó y cómo se asociaron los lotes). Guardar el script junto a los datos garantiza la reproducibilidad total a largo plazo.
 
 ---
 
@@ -55,19 +58,22 @@ from icptools import (
     export_excel_formula_report,
 )
 
+# Siempre co-localizar el script con los datos crudos
+data_dir = Path(__file__).resolve().parent
+
 # 1. Cargar datos del instrumento y tabla de calibración
-batch = parse_agilent_counts("datos/FQ_COUNTS.xlsx")
-cal_data = parse_agilent_calibration("datos/CAL.xlsx")
+batch = parse_agilent_counts(data_dir / "FQ_COUNTS.xlsx")
+cal_data = parse_agilent_calibration(data_dir / "CAL.xlsx")
 apply_calibration_table(batch, cal_data)
 
 # 2. Ejecutar procesamiento con blank_offset (ideal para trazas cerca de cero)
 proc = Processor(batch, weighting="blank_offset")
 proc.process()
 
-# 3. Exportar Excel nativo con fórmulas
+# 3. Exportar Excel nativo con fórmulas en la misma carpeta
 export_excel_formula_report(
     batch=batch,
-    output_path="reportes/Reporte_Aguas.xlsx",
+    output_path=data_dir / "Reporte_Aguas.xlsx",
     instrument_loqs={"Cr52": 0.2, "As75": 0.5, "Pb208": 0.1},
     report_title="Monitoreo de Aguas Superficiales",
 )
@@ -80,6 +86,7 @@ export_excel_formula_report(
 En matrices ambientales (ej. cuencas fluviales), los cationes mayoritarios ($\text{Na}$, $\text{Mg}$, $\text{K}$, $\text{Ca}$) saturan el detector sin diluir, mientras que las trazas ($\text{Cr}$, $\text{Ni}$, $\text{Cu}$, $\text{As}$, $\text{Pb}$) caen bajo el LoQ si se diluyen. Se miden ambas y se consolida un reporte en 3 pestañas.
 
 ```python
+from pathlib import Path
 from icptools import (
     parse_agilent_counts,
     apply_calibration_table,
@@ -87,9 +94,11 @@ from icptools import (
     export_split_dilution_report,
 )
 
+data_dir = Path(__file__).resolve().parent
+
 # 1. Cargar y calibrar
-batch = parse_agilent_counts("datos/FQ_COUNTS.xlsx")
-apply_calibration_table(batch, "datos/CAL.xlsx")
+batch = parse_agilent_counts(data_dir / "FQ_COUNTS.xlsx")
+apply_calibration_table(batch, data_dir / "CAL.xlsx")
 
 # 2. Procesar
 proc = Processor(batch, weighting="blank_offset")
@@ -99,13 +108,13 @@ proc.process()
 altos = ["Na23", "Mg24", "K39", "Ca44"]
 bajos = ["Cr52", "Mn55", "Fe56", "Ni60", "Cu63", "Zn66", "As75", "Cd111", "Pb208"]
 
-# 4. Exportar reporte de 3 pestañas
+# 4. Exportar reporte de 3 pestañas en la misma carpeta
 # Pestaña 1: Altos (mg/L, DF=100)
 # Pestaña 2: Bajos (ug/L, DF=1)
 # Pestaña 3: Unificado (enlace vivo a las pestañas 1 y 2 sin errores #VALUE!)
 export_split_dilution_report(
     batch=batch,
-    output_path="reportes/REPORTE_CONSOLIDADO_3_PESTANIAS.xlsx",
+    output_path=data_dir / "REPORTE_CONSOLIDADO_3_PESTANIAS.xlsx",
     high_analytes=altos,
     low_analytes=bajos,
     high_units="mg/L",
@@ -123,9 +132,12 @@ Muestras sólidas digeridas por microondas (ej. $0.5\text{ g}$ llevados a $50\te
 Se resta el blanco de método (`MBLK`) correspondiente al lote de digestión (`prep_group`) y se corrige por porcentaje de humedad para reportar en base seca.
 
 ```python
+from pathlib import Path
 from icptools.models import Batch, Sample, Analyte, SampleType, SampleMatrix
 from icptools.pipeline import Processor
 from icptools.reporting import export_excel_formula_report
+
+data_dir = Path(__file__).resolve().parent
 
 batch = Batch(name="Soil_Digestion_Run")
 batch.add_analyte(Analyte("Pb208", "Pb", 208))
@@ -161,7 +173,7 @@ proc.process()
 
 export_excel_formula_report(
     batch=batch,
-    output_path="reportes/Reporte_Suelos_Auditables.xlsx",
+    output_path=data_dir / "Reporte_Suelos_Auditables.xlsx",
     analytes=["Pb208"],
     instrument_loqs={"Pb208": 0.1},
     report_title="Control de Metales en Suelos",
@@ -180,6 +192,12 @@ En la hoja generada:
 En una misma secuencia de ICP-MS se miden efluentes (líquidos directos o diluidos) junto con muestras sólidas de lodo digerido:
 
 ```python
+from pathlib import Path
+from icptools.models import Sample, SampleType, SampleMatrix
+from icptools.pipeline import Processor
+from icptools.reporting import export_excel_formula_report
+
+data_dir = Path(__file__).resolve().parent
 # Muestra líquida (no tiene masa ni volumen de digestión; usa Conc * Dilution)
 effluent = Sample("EFLUENTE_01", SampleType.UNKNOWN, matrix=SampleMatrix.LIQUID)
 effluent.dilution_factor = 5.0 # Diluido 1:5
@@ -196,7 +214,7 @@ batch.add_sample(sludge)
 
 proc = Processor(batch)
 proc.process()
-export_excel_formula_report(batch, "reportes/Batch_Mixto.xlsx")
+export_excel_formula_report(batch, data_dir / "Batch_Mixto.xlsx")
 ```
 
 El motor exportador activa automáticamente las columnas de preparación (`Mass`, `% Humidity`, `Vol`) y aplica la fórmula de líquido a las filas líquidas y la de sólido a las filas sólidas.
@@ -208,6 +226,7 @@ El motor exportador activa automáticamente las columnas de preparación (`Mass`
 En lugar de cargar masas y volúmenes muestra por muestra en código, se utiliza una planilla Excel o CSV de preparación de laboratorio (con columnas en español o inglés como `Muestra`, `Masa (g)`, `Volumen (mL)`, `% Humedad`, `Factor Dilución`, `Lote`, `Tipo Muestra`):
 
 ```python
+from pathlib import Path
 from icptools import (
     parse_agilent_counts,
     parse_agilent_calibration,
@@ -217,20 +236,22 @@ from icptools import (
     export_excel_formula_report,
 )
 
+data_dir = Path(__file__).resolve().parent
+
 # 1. Cargar datos del equipo y calibración
-batch = parse_agilent_counts("datos/FQ_COUNTS.xlsx")
-apply_calibration_table(batch, "datos/CAL.xlsx")
+batch = parse_agilent_counts(data_dir / "FQ_COUNTS.xlsx")
+apply_calibration_table(batch, data_dir / "CAL.xlsx")
 
 # 2. Inyectar pesadas y preparación desde la planilla del laboratorio
-apply_sample_prep(batch, "datos/PLANILLA_PREPARACION.xlsx")
+apply_sample_prep(batch, data_dir / "PLANILLA_PREPARACION.xlsx")
 
-# 3. Procesar y generar reporte
+# 3. Procesar y generar reporte en la misma carpeta
 proc = Processor(batch)
 proc.process()
 
 export_excel_formula_report(
     batch=batch,
-    output_path="reportes/Reporte_Suelos_Automatizado.xlsx",
+    output_path=data_dir / "Reporte_Suelos_Automatizado.xlsx",
     report_title="Control de Metales en Suelos y Sedimentos",
 )
 ```
@@ -271,3 +292,14 @@ Antes de considerar una tarea analítica como completada:
    ```
 3. **Comprobar Réplicas de Campo y Duplicados**:
    Calcular el RPD (Relative Percent Difference) entre réplicas (como `ALPHA` y `BETA`). Para elementos mayoritarios, el RPD esperado es $< 10\%$.
+
+---
+
+## 6. Caso de Referencia Canónico (`examples/environmental_water_study/`)
+
+Para un ejemplo completo, funcional y auditable con archivos de Agilent MassHunter reales (anonimizados), consulta el directorio [`examples/environmental_water_study/`](file:///home/damm/Projects/icptools/examples/environmental_water_study/):
+* `CAL.xlsx`: Tabla de calibración con 6 niveles y 4 estándares internos ($\text{Sc}^{45}, \text{Ge}^{72}, \text{In}^{115}, \text{Bi}^{209}$).
+* `FQ_COUNTS.xlsx`: Cuentas instrumentales crudas con réplicas y dilución 1:100.
+* `process_run.py`: Script de procesamiento ejecutable co-localizado con los datos.
+* `Reporte_Consolidado_3_Pestanias.xlsx`: Entregable final generado con fórmulas nativas vivas.
+* `README.md`: Documentación del caso de estudio ambiental.

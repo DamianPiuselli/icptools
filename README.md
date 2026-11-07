@@ -86,6 +86,16 @@ icptools qc FQ_COUNTS.xlsx -c CAL.xlsx
 
 ---
 
+## Examples & Reproducible Datasets
+
+Explore [`examples/environmental_water_study/`](examples/environmental_water_study/):
+A complete, anonymized Agilent MassHunter ICP-MS batch measuring river, estuary, and urban canal waters:
+- **Major cations** (Na, Mg, K, Ca) measured at 1:100 dilution and reported in $\text{mg/L}$.
+- **Trace metals** (Cr, Mn, Fe, Ni, Cu, Zn, As, Cd, Pb) measured undiluted in $\mu\text{g/L}$.
+- Includes raw instrument counts (`FQ_COUNTS.xlsx`), calibration table (`CAL.xlsx`), co-located processing script (`process_run.py`), and the generated 3-sheet audit-ready workbook (`Reporte_Consolidado_3_Pestanias.xlsx`).
+
+---
+
 ## Documentation for AI Agents & Developers
 
 See [AGENTS.md](AGENTS.md) for canonical recipes, unit handling conventions, and validation guidelines.
